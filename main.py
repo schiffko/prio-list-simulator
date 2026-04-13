@@ -5,6 +5,7 @@ Multi-platform desktop application for simulating multiple Modbus-TCP charging s
 
 import sys
 import socket
+import struct
 from datetime import datetime
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -167,18 +168,18 @@ class ChargingStationSimulator:
 
 class StationDataBlock(ModbusSequentialDataBlock):
     """Custom datablock that live-syncs with a ChargingStationSimulator.
-    
+
     pymodbus 3.x calls getValues/setValues on the datablock object,
     so we override those to pull live data from the station on every read
     and delegate writes to the station's write_register method.
     """
-    
+
     def __init__(self, station: ChargingStationSimulator):
         super().__init__(0, [0] * 100)
         self.station = station
         self.last_request_time = "Never"
         self.last_request_type = "None"
-    
+
     def getValues(self, address, count=1):
         # pymodbus uses 1-based addressing internally (address+1 in ModbusDeviceContext)
         # so we convert back to 0-based
@@ -191,7 +192,7 @@ class StationDataBlock(ModbusSequentialDataBlock):
         result = values[addr:addr + count]
         print(f"[Modbus RX] Unit {self.station.station_id}: Read HR {addr} qty {count} -> {result}")
         return result
-    
+
     def setValues(self, address, values):
         addr = address - 1
         self.last_request_time = datetime.now().strftime("%H:%M:%S")
@@ -199,6 +200,53 @@ class StationDataBlock(ModbusSequentialDataBlock):
         print(f"[Modbus TX] Unit {self.station.station_id}: Write HR {addr} qty {len(values)} <- {values}")
         for i, value in enumerate(values):
             self.station.write_register(addr + i, value)
+
+
+class GlobalDataBlock(ModbusSequentialDataBlock):
+    """Datablock for the global surplus power register (Unit-ID 100).
+
+    Register 0-1: Überschuss in Watt als Float32 (IEEE 754, Big Endian)
+                  Register 0 = High Word, Register 1 = Low Word
+                  Positiv = PV-Überschuss, Negativ = Netzbezug
+    """
+
+    def __init__(self, main_window):
+        super().__init__(0, [0] * 10)
+        self.main_window = main_window
+
+    @staticmethod
+    def _float_to_regs(value: float):
+        """Encode a float32 as two Modbus registers (ABCD Big Endian: high word first)."""
+        packed = struct.pack('>f', value)
+        high = (packed[0] << 8) | packed[1]
+        low  = (packed[2] << 8) | packed[3]
+        return high, low
+
+    @staticmethod
+    def _regs_to_float(high: int, low: int) -> float:
+        """Decode two Modbus registers (ABCD Big Endian) back to float32."""
+        packed = struct.pack('>HH', high & 0xFFFF, low & 0xFFFF)
+        return struct.unpack('>f', packed)[0]
+
+    def getValues(self, address, count=1):
+        addr = address - 1
+        charger_total_w = sum(s.current_power * 1000 for s in self.main_window.stations)
+        result_w = self.main_window.surplus_power + charger_total_w
+        high, low = self._float_to_regs(result_w)
+        reg_map = {0: high, 1: low}
+        result = [reg_map.get(addr + i, 0) for i in range(count)]
+        print(f"[Modbus RX] Unit 100 (Global): Read HR {addr} qty {count} -> {result} "
+              f"(Überschuss {self.main_window.surplus_power:+.1f}W + Charger {charger_total_w:.1f}W = {result_w:+.1f}W)")
+        return result
+
+    def setValues(self, address, values):
+        addr = address - 1
+        # Accept write of 1 or 2 registers starting at 0
+        if addr == 0 and len(values) >= 2:
+            value = self._regs_to_float(values[0], values[1])
+            self.main_window.surplus_power = float(value)
+            self.main_window.update_surplus_display()
+            print(f"[Modbus TX] Unit 100 (Global): Write HR 0-1 <- {value:.1f} W")
 
 
 class DynamicStationProxy:
@@ -227,17 +275,23 @@ class DynamicStationProxy:
         return self._blocks[unit_id]
     
     def __getitem__(self, unit_id: int):
+        if unit_id == 100:
+            if 100 not in self._blocks:
+                self._blocks[100] = GlobalDataBlock(self.main_window)
+            return ModbusDeviceContext(hr=self._blocks[100])
         block = self._get_or_create_block(unit_id)
         if block is None:
             empty = ModbusSequentialDataBlock(0, [0] * 100)
             return ModbusDeviceContext(hr=empty)
         return ModbusDeviceContext(hr=block)
-    
+
     def __contains__(self, unit_id: int) -> bool:
+        if unit_id == 100:
+            return True
         return any(s.station_id == unit_id for s in self.main_window.stations)
-    
+
     def keys(self):
-        return [s.station_id for s in self.main_window.stations]
+        return [s.station_id for s in self.main_window.stations] + [100]
 
 
 class ModbusServerThread(threading.Thread):
@@ -424,6 +478,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.stations = []
         self.modbus_server_thread = None
+        self.surplus_power = 0.0  # Globaler PV-Überschuss in Watt (Unit-ID 100, Register 0)
         self.setup_ui()
         self.start_modbus_server()
         self.start_update_timer()
@@ -453,6 +508,33 @@ class MainWindow(QMainWindow):
         clear_btn.clicked.connect(self.clear_stations)
         control_layout.addWidget(clear_btn)
         
+        # --- Globaler PV-Überschuss (Unit-ID 100, Register 0) ---
+        surplus_group = QGroupBox("PV-Überschuss (Unit-ID 100)")
+        surplus_layout = QHBoxLayout()
+        surplus_layout.setContentsMargins(6, 4, 6, 4)
+
+        self.surplus_spin = QDoubleSpinBox()
+        self.surplus_spin.setRange(-32768.0, 32767.0)
+        self.surplus_spin.setDecimals(0)
+        self.surplus_spin.setSuffix(" W")
+        self.surplus_spin.setValue(0.0)
+        self.surplus_spin.setFixedWidth(120)
+        self.surplus_spin.valueChanged.connect(self._on_surplus_changed)
+        surplus_layout.addWidget(self.surplus_spin)
+
+        surplus_layout.addWidget(QLabel("Eingabe:"))
+        self.surplus_display = QLabel("0 W")
+        self.surplus_display.setStyleSheet("font-family: monospace; color: #444;")
+        surplus_layout.addWidget(self.surplus_display)
+
+        surplus_layout.addWidget(QLabel("→  Ausgabe:"))
+        self.surplus_result_label = QLabel("0 W")
+        self.surplus_result_label.setStyleSheet("font-family: monospace; font-weight: bold; color: #1a7a1a;")
+        surplus_layout.addWidget(self.surplus_result_label)
+
+        surplus_group.setLayout(surplus_layout)
+        control_layout.addWidget(surplus_group)
+
         control_layout.addStretch()
 
         ips = []
@@ -519,12 +601,31 @@ class MainWindow(QMainWindow):
         self.timer.timeout.connect(self.update_stations)
         self.timer.start(1000)
         
+    def _on_surplus_changed(self, value: float):
+        self.surplus_power = value
+        self.update_surplus_display()
+
+    def update_surplus_display(self):
+        """Aktualisiert die Anzeige und synchronisiert den SpinBox-Wert."""
+        self.surplus_display.setText(f"{int(self.surplus_power):+d} W")
+        self.surplus_spin.blockSignals(True)
+        self.surplus_spin.setValue(self.surplus_power)
+        self.surplus_spin.blockSignals(False)
+        self._refresh_surplus_result()
+
+    def _refresh_surplus_result(self):
+        charger_total_w = sum(s.current_power * 1000 for s in self.stations)
+        result_w = int(self.surplus_power + charger_total_w)
+        self.surplus_result_label.setText(f"{result_w:+d} W")
+
     def update_stations(self):
         for station in self.stations:
             station.update()
-            
+
         for widget in self.findChildren(StationWidget):
             widget.update_display()
+
+        self._refresh_surplus_result()
 
 
 def main():

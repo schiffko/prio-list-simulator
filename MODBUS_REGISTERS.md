@@ -10,7 +10,7 @@ Jede Ladestation wird über dieselbe IP/Port-Adresse erreicht, differenzert übe
 |-----------|------|
 | Host | `0.0.0.0` (alle Interfaces) |
 | Port | `5020` (zentral für alle Stationen) |
-| Unit ID | Station-ID (1, 2, 3, ...) |
+| Unit ID | Station-ID (1, 2, 3, ...) oder 100 (Global) |
 | Protokoll | Modbus TCP |
 
 ### Beispiele
@@ -21,6 +21,7 @@ Jede Ladestation wird über dieselbe IP/Port-Adresse erreicht, differenzert übe
 | Station 2 | 5020 | 2 |
 | Station 3 | 5020 | 3 |
 | Station N | 5020 | N |
+| **Global (Überschuss)** | **5020** | **100** |
 
 ### Netzwerk
 
@@ -45,6 +46,26 @@ Der Server ist über alle Netzwerkinterfaces erreichbar, z.B.:
 | 7 | Error Code | UINT16 | - | 1 | R | 0-255 |
 | 8-9 | Set Current | UINT32 | mA | 1 | R/W | 0-32000 |
 | 10 | Phases | UINT16 | - | 1 | R/W | 1, 3 |
+
+---
+
+## Globale Register (Unit-ID 100)
+
+| Adresse | Name | Typ | Einheit | Zugriff | Beschreibung |
+|---------|------|-----|---------|---------|--------------|
+| 0–1 | PV-Überschuss | Float32 | W | R/W | High Word (Reg 0), Low Word (Reg 1) |
+
+> **Hinweis:** IEEE 754 Float32, Big Endian (ABCD). Positiver Wert = PV-Überschuss, negativer Wert = Netzbezug.  
+> Der zurückgegebene Wert = eingestellter Überschuss + Gesamtleistung aller Charger.  
+> Die Unit-ID 100 ist fest reserviert und unabhängig von den Ladestations-IDs.
+
+**Beispiel lesen (Python):**
+```python
+result = client.read_holding_registers(address=0, count=2, device_id=100)
+import struct
+packed = struct.pack('>HH', result.registers[0], result.registers[1])
+watts = struct.unpack('>f', packed)[0]  # z.B. -1000.0 oder 4000.0
+```
 
 ---
 
