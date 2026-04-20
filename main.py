@@ -6,16 +6,57 @@ Multi-platform desktop application for simulating multiple Modbus-TCP charging s
 import sys
 import socket
 import struct
+import json
+from pathlib import Path
 from datetime import datetime
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QSpinBox, QGroupBox, QScrollArea,
-    QGridLayout, QDoubleSpinBox, QComboBox, QCheckBox
+    QGridLayout, QDoubleSpinBox, QComboBox, QCheckBox,
+    QFileDialog, QMessageBox
 )
 from PyQt6.QtCore import QTimer, Qt
 from pymodbus.server import StartTcpServer
 from pymodbus.datastore import ModbusDeviceContext, ModbusServerContext, ModbusSequentialDataBlock
 import threading
+import shutil
+
+
+class RegulationLogger:
+    """Writes a machine-readable control log for later analysis."""
+
+    def __init__(self):
+        log_dir = Path(__file__).resolve().parent / "logs"
+        log_dir.mkdir(exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.path = log_dir / f"regulation_log_{timestamp}.jsonl"
+
+    def log(self, *, surplus_input_w: float, surplus_output_w: float, stations: list):
+        entry = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "surplus_input_w": round(surplus_input_w, 1),
+            "surplus_output_w": round(surplus_output_w, 1),
+            "stations": [
+                {
+                    "station_id": station.station_id,
+                    "status_code": station.status_code,
+                    "status": station.status,
+                    "power_kw": round(station.current_power, 3),
+                    "set_current_a": round(station.set_current_ma / 1000.0, 3),
+                    "current_a": round(station.current_amperage, 3),
+                    "phases": station.phases,
+                }
+                for station in stations
+            ],
+        }
+        with self.path.open("a", encoding="utf-8") as log_file:
+            log_file.write(json.dumps(entry, ensure_ascii=True) + "\n")
+
+    def clear(self):
+        self.path.write_text("", encoding="utf-8")
+
+    def export_to(self, target_path: str):
+        shutil.copyfile(self.path, target_path)
 
 
 class ChargingStationSimulator:
@@ -479,6 +520,7 @@ class MainWindow(QMainWindow):
         self.stations = []
         self.modbus_server_thread = None
         self.surplus_power = 0.0  # Globaler PV-Überschuss in Watt (Unit-ID 100, Register 0)
+        self.regulation_logger = RegulationLogger()
         self.setup_ui()
         self.start_modbus_server()
         self.start_update_timer()
@@ -507,6 +549,14 @@ class MainWindow(QMainWindow):
         clear_btn = QPushButton("Clear All")
         clear_btn.clicked.connect(self.clear_stations)
         control_layout.addWidget(clear_btn)
+
+        export_log_btn = QPushButton("Export Log")
+        export_log_btn.clicked.connect(self.export_log)
+        control_layout.addWidget(export_log_btn)
+
+        clear_log_btn = QPushButton("Clear Log")
+        clear_log_btn.clicked.connect(self.clear_log)
+        control_layout.addWidget(clear_log_btn)
         
         # --- Globaler PV-Überschuss (Unit-ID 100, Register 0) ---
         surplus_group = QGroupBox("PV-Überschuss (Unit-ID 100)")
@@ -615,8 +665,40 @@ class MainWindow(QMainWindow):
 
     def _refresh_surplus_result(self):
         charger_total_w = sum(s.current_power * 1000 for s in self.stations)
-        result_w = int(self.surplus_power + charger_total_w)
+        result_w = int(self.get_surplus_output_w())
         self.surplus_result_label.setText(f"{result_w:+d} W")
+
+    def get_surplus_output_w(self) -> float:
+        charger_total_w = sum(s.current_power * 1000 for s in self.stations)
+        return self.surplus_power + charger_total_w
+
+    def log_regulation_state(self):
+        self.regulation_logger.log(
+            surplus_input_w=self.surplus_power,
+            surplus_output_w=self.get_surplus_output_w(),
+            stations=self.stations,
+        )
+
+    def export_log(self):
+        default_name = self.regulation_logger.path.name
+        target_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Log",
+            str(self.regulation_logger.path.with_name(default_name)),
+            "JSON Lines (*.jsonl);;All Files (*)",
+        )
+        if not target_path:
+            return
+        self.regulation_logger.export_to(target_path)
+        QMessageBox.information(self, "Log exportiert", f"Log exportiert nach:\n{target_path}")
+
+    def clear_log(self):
+        self.regulation_logger.clear()
+        QMessageBox.information(
+            self,
+            "Log geleert",
+            f"Aktuelles Log geleert:\n{self.regulation_logger.path}",
+        )
 
     def update_stations(self):
         for station in self.stations:
@@ -626,6 +708,7 @@ class MainWindow(QMainWindow):
             widget.update_display()
 
         self._refresh_surplus_result()
+        self.log_regulation_state()
 
 
 def main():
