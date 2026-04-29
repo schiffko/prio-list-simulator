@@ -1,75 +1,49 @@
 """
-EV Charging Station Simulator
-Multi-platform desktop application for simulating multiple Modbus-TCP charging stations
+EV Charging Station + Smartfox Slave Energy Meter Simulator
+
+Charger simulation  (port 5020, unit-IDs = station IDs):
+  Implements the register map expected by car_cc_debug.c
+
+Energy meter simulation  (port 502, unit-ID 1):
+  Implements the register map read by em_smartfox_slave.c
+
+  Register map (PDU 0-indexed = Modbus address - 1):
+    40999  4 regs  int64   energy forward  (Wh)
+    41003  4 regs  uint64  energy reverse  (Wh)
+    41017  2 regs  int32   total power     (W)
+    41019  6 regs  3×int32 phase powers    (W)
+    41028  6 regs  3×int32 phase currents  (mA)
 """
 
 import sys
 import socket
 import struct
-import json
-from pathlib import Path
+import asyncio
+import threading
 from datetime import datetime
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QSpinBox, QGroupBox, QScrollArea,
-    QGridLayout, QDoubleSpinBox, QComboBox, QCheckBox,
-    QFileDialog, QMessageBox
+    QGridLayout, QDoubleSpinBox, QComboBox, QCheckBox, QTabWidget
 )
 from PyQt6.QtCore import QTimer, Qt
-from pymodbus.server import StartTcpServer
-from pymodbus.datastore import ModbusDeviceContext, ModbusServerContext, ModbusSequentialDataBlock
-import threading
-import shutil
 
 
-class RegulationLogger:
-    """Writes a machine-readable control log for later analysis."""
-
-    def __init__(self):
-        log_dir = Path(__file__).resolve().parent / "logs"
-        log_dir.mkdir(exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.path = log_dir / f"regulation_log_{timestamp}.jsonl"
-
-    def log(self, *, surplus_input_w: float, surplus_output_w: float, stations: list):
-        entry = {
-            "timestamp": datetime.now().isoformat(timespec="seconds"),
-            "surplus_input_w": round(surplus_input_w, 1),
-            "surplus_output_w": round(surplus_output_w, 1),
-            "stations": [
-                {
-                    "station_id": station.station_id,
-                    "status_code": station.status_code,
-                    "status": station.status,
-                    "power_kw": round(station.current_power, 3),
-                    "set_current_a": round(station.set_current_ma / 1000.0, 3),
-                    "current_a": round(station.current_amperage, 3),
-                    "phases": station.phases,
-                }
-                for station in stations
-            ],
-        }
-        with self.path.open("a", encoding="utf-8") as log_file:
-            log_file.write(json.dumps(entry, ensure_ascii=True) + "\n")
-
-    def clear(self):
-        self.path.write_text("", encoding="utf-8")
-
-    def export_to(self, target_path: str):
-        shutil.copyfile(self.path, target_path)
-
+# ---------------------------------------------------------------------------
+# Charger simulator (unchanged)
+# ---------------------------------------------------------------------------
 
 class ChargingStationSimulator:
     """Simulates a single EV charging station with Modbus TCP interface"""
-    
-    STATUS_UNPLUGGED = 0
+
+    STATUS_UNPLUGGED    = 0
     STATUS_DISCONNECTED = 1
-    STATUS_CONNECTED = 2
-    STATUS_CHARGING = 3
-    STATUS_ERROR = 4
+    STATUS_CONNECTED    = 2
+    STATUS_CHARGING     = 3
+    STATUS_ERROR        = 4
     STATUS_UNAUTHORIZED = 5
-    STATUS_STOP = 6
-    
+    STATUS_STOP         = 6
+
     STATUS_NAMES = {
         0: "Unplugged",
         1: "Disconnected",
@@ -79,49 +53,48 @@ class ChargingStationSimulator:
         5: "Unauthorized",
         6: "Stop"
     }
-    
+
     def __init__(self, station_id: int):
-        self.station_id = station_id
-        self.is_charging = False
-        self.current_power = 0.0
-        self.max_power = 22.0
+        self.station_id       = station_id
+        self.is_charging      = False
+        self.current_power    = 0.0
+        self.max_power        = 22.0
         self.current_amperage = 0.0
-        self.target_amperage = 0.0
-        self.max_amperage = 32.0
-        self.voltage = 230.0
-        self.phases = 3
+        self.target_amperage  = 0.0
+        self.max_amperage     = 32.0
+        self.voltage          = 230.0
+        self.phases           = 3
         self.energy_delivered = 0.0
         self.session_duration = 0
-        self.status_code = 0
-        self.error_code = 0
-        self.set_current_ma = 0
-        self.manual_amperage = False
-        self.registers = [0] * 20
-        
+        self.status_code      = 0
+        self.error_code       = 0
+        self.set_current_ma   = 0
+        self.manual_amperage  = False
+        self.registers        = [0] * 20
+        self.last_request_time = "Never"
+        self.last_request_type = "None"
+
     @property
     def status(self):
         return self.STATUS_NAMES.get(self.status_code, "Unknown")
-        
+
     def get_modbus_data(self) -> list:
-        """Returns all Modbus registers as a list"""
-        self.registers[0] = self.status_code
-        self.registers[1] = int(self.current_power * 10)
-        self.registers[2] = int(self.voltage * 10)
-        self.registers[3] = int(self.current_amperage * 10)
-        self.registers[4] = int(self.energy_delivered * 100) & 0xFFFF
-        self.registers[5] = (int(self.energy_delivered * 100) >> 16) & 0xFFFF
-        self.registers[6] = int(self.max_power * 10)
-        self.registers[7] = self.error_code
-        self.registers[8] = self.set_current_ma & 0xFFFF
-        self.registers[9] = (self.set_current_ma >> 16) & 0xFFFF
+        self.registers[0]  = self.status_code
+        self.registers[1]  = int(self.current_power * 10)
+        self.registers[2]  = int(self.voltage * 10)
+        self.registers[3]  = int(self.current_amperage * 10)
+        self.registers[4]  = int(self.energy_delivered * 100) & 0xFFFF
+        self.registers[5]  = (int(self.energy_delivered * 100) >> 16) & 0xFFFF
+        self.registers[6]  = int(self.max_power * 10)
+        self.registers[7]  = self.error_code
+        self.registers[8]  = self.set_current_ma & 0xFFFF
+        self.registers[9]  = (self.set_current_ma >> 16) & 0xFFFF
         self.registers[10] = self.phases
         return self.registers
-    
+
     def write_register(self, address: int, value: int) -> bool:
-        """Write to a Modbus register"""
         if address < 0 or address >= len(self.registers):
             return False
-        
         if address == 8:
             self.set_current_ma = (self.set_current_ma & 0xFFFF0000) | (value & 0xFFFF)
         elif address == 9:
@@ -134,61 +107,55 @@ class ChargingStationSimulator:
             return False
         else:
             self.registers[address] = value
-        
         self._apply_set_current()
         return True
-    
+
     def _apply_set_current(self):
         if self.manual_amperage:
             return
         amps = self.set_current_ma / 1000.0
         self.set_amperage(amps)
         self._auto_transition()
-    
+
     def set_status(self, status_code: int):
         self.status_code = status_code
         if status_code in (self.STATUS_CHARGING, self.STATUS_CONNECTED):
             if self.set_current_ma > 0:
-                self.is_charging = True
+                self.is_charging     = True
                 self.target_amperage = self.set_current_ma / 1000.0
             else:
-                self.is_charging = False
-                self.target_amperage = 0.0
+                self.is_charging      = False
+                self.target_amperage  = 0.0
                 self.current_amperage = 0.0
-                self.current_power = 0.0
+                self.current_power    = 0.0
         else:
-            self.is_charging = False
-            self.current_power = 0.0
+            self.is_charging      = False
+            self.current_power    = 0.0
             self.current_amperage = 0.0
-            self.target_amperage = 0.0
+            self.target_amperage  = 0.0
             self.energy_delivered = 0.0
-    
-    def plug_in(self):
-        self.set_status(self.STATUS_CONNECTED)
-    
-    def plug_out(self):
-        self.set_status(self.STATUS_UNPLUGGED)
-    
-    def set_error(self):
-        self.set_status(self.STATUS_ERROR)
-        
+
+    def plug_in(self):  self.set_status(self.STATUS_CONNECTED)
+    def plug_out(self): self.set_status(self.STATUS_UNPLUGGED)
+    def set_error(self): self.set_status(self.STATUS_ERROR)
+
     def set_amperage(self, amps: float):
         self.target_amperage = min(amps, self.max_amperage)
-    
+
     def _auto_transition(self):
         if self.status_code not in (self.STATUS_CONNECTED, self.STATUS_CHARGING):
             return
         if self.set_current_ma > 0 and not self.is_charging:
-            self.is_charging = True
+            self.is_charging     = True
             self.target_amperage = self.set_current_ma / 1000.0
-            self.status_code = self.STATUS_CHARGING
+            self.status_code     = self.STATUS_CHARGING
         elif self.set_current_ma == 0 and self.is_charging:
-            self.is_charging = False
-            self.target_amperage = 0.0
+            self.is_charging      = False
+            self.target_amperage  = 0.0
             self.current_amperage = 0.0
-            self.current_power = 0.0
-            self.status_code = self.STATUS_CONNECTED
-    
+            self.current_power    = 0.0
+            self.status_code      = self.STATUS_CONNECTED
+
     def update(self):
         if self.is_charging:
             self.session_duration += 1
@@ -199,257 +166,321 @@ class ChargingStationSimulator:
                     self.current_amperage = self.target_amperage
                 else:
                     self.current_amperage += step
-            self.current_power = self.current_amperage * self.voltage * self.phases / 1000
+            self.current_power     = self.current_amperage * self.voltage * self.phases / 1000
             self.energy_delivered += (self.current_power / 3600)
             if self.current_amperage == 0.0 and self.target_amperage == 0.0:
-                self.is_charging = False
+                self.is_charging   = False
                 self.current_power = 0.0
-                self.status_code = self.STATUS_CONNECTED
+                self.status_code   = self.STATUS_CONNECTED
 
 
-class StationDataBlock(ModbusSequentialDataBlock):
-    """Custom datablock that live-syncs with a ChargingStationSimulator.
+# ---------------------------------------------------------------------------
+# Energy meter simulator (new)
+# ---------------------------------------------------------------------------
 
-    pymodbus 3.x calls getValues/setValues on the datablock object,
-    so we override those to pull live data from the station on every read
-    and delegate writes to the station's write_register method.
-    """
+REG_ENERGY_FOR   = 40999
+REG_ENERGY_REV   = 41003
+REG_POWER        = 41017
+REG_POWER_PHASES = 41019
+REG_CURRENT      = 41028
 
-    def __init__(self, station: ChargingStationSimulator):
-        super().__init__(0, [0] * 100)
-        self.station = station
+
+class SmartfoxSlaveSimulator:
+    """Models a Smartfox energy meter read by em_smartfox_slave.c"""
+
+    def __init__(self):
+        self.total_power_w     = 0
+        self.phase_powers_w    = [0, 0, 0]
+        self.phase_currents_ma = [0, 0, 0]
+        self.energy_forward_wh = 0.0
+        self.energy_reverse_wh = 0.0
         self.last_request_time = "Never"
         self.last_request_type = "None"
 
-    def getValues(self, address, count=1):
-        # pymodbus uses 1-based addressing internally (address+1 in ModbusDeviceContext)
-        # so we convert back to 0-based
-        addr = address - 1
-        self.last_request_time = datetime.now().strftime("%H:%M:%S")
-        self.last_request_type = f"Read HR {addr} (qty {count})"
-        values = self.station.get_modbus_data()
-        if addr < 0 or addr + count > len(values):
-            return [0] * count
-        result = values[addr:addr + count]
-        print(f"[Modbus RX] Unit {self.station.station_id}: Read HR {addr} qty {count} -> {result}")
-        return result
-
-    def setValues(self, address, values):
-        addr = address - 1
-        self.last_request_time = datetime.now().strftime("%H:%M:%S")
-        self.last_request_type = f"Write HR {addr} (qty {len(values)})"
-        print(f"[Modbus TX] Unit {self.station.station_id}: Write HR {addr} qty {len(values)} <- {values}")
-        for i, value in enumerate(values):
-            self.station.write_register(addr + i, value)
-
-
-class GlobalDataBlock(ModbusSequentialDataBlock):
-    """Datablock for the global surplus power register (Unit-ID 100).
-
-    Register 0-1: Überschuss in Watt als Float32 (IEEE 754, Big Endian)
-                  Register 0 = High Word, Register 1 = Low Word
-                  Positiv = PV-Überschuss, Negativ = Netzbezug
-    """
-
-    def __init__(self, main_window):
-        super().__init__(0, [0] * 10)
-        self.main_window = main_window
+    @staticmethod
+    def _pack32(value: int, regs: dict, addr: int):
+        v = value & 0xFFFFFFFF
+        regs[addr]     = (v >> 16) & 0xFFFF
+        regs[addr + 1] = v & 0xFFFF
 
     @staticmethod
-    def _float_to_regs(value: float):
-        """Encode a float32 as two Modbus registers (ABCD Big Endian: high word first)."""
-        packed = struct.pack('>f', value)
-        high = (packed[0] << 8) | packed[1]
-        low  = (packed[2] << 8) | packed[3]
-        return high, low
+    def _pack64(value: int, regs: dict, addr: int):
+        v = int(value) & 0xFFFFFFFFFFFFFFFF
+        regs[addr]     = (v >> 48) & 0xFFFF
+        regs[addr + 1] = (v >> 32) & 0xFFFF
+        regs[addr + 2] = (v >> 16) & 0xFFFF
+        regs[addr + 3] = v & 0xFFFF
 
-    @staticmethod
-    def _regs_to_float(high: int, low: int) -> float:
-        """Decode two Modbus registers (ABCD Big Endian) back to float32."""
-        packed = struct.pack('>HH', high & 0xFFFF, low & 0xFFFF)
-        return struct.unpack('>f', packed)[0]
+    def build_registers(self) -> dict:
+        regs = {}
+        self._pack32(self.total_power_w, regs, REG_POWER)
+        for i in range(3):
+            self._pack32(self.phase_powers_w[i],    regs, REG_POWER_PHASES + i * 2)
+            self._pack32(self.phase_currents_ma[i], regs, REG_CURRENT      + i * 2)
+        self._pack64(int(self.energy_forward_wh), regs, REG_ENERGY_FOR)
+        self._pack64(int(self.energy_reverse_wh), regs, REG_ENERGY_REV)
+        return regs
 
-    def getValues(self, address, count=1):
-        addr = address - 1
-        charger_total_w = sum(s.current_power * 1000 for s in self.main_window.stations)
-        result_w = self.main_window.surplus_power + charger_total_w
-        high, low = self._float_to_regs(result_w)
-        reg_map = {0: high, 1: low}
-        result = [reg_map.get(addr + i, 0) for i in range(count)]
-        print(f"[Modbus RX] Unit 100 (Global): Read HR {addr} qty {count} -> {result} "
-              f"(Überschuss {self.main_window.surplus_power:+.1f}W + Charger {charger_total_w:.1f}W = {result_w:+.1f}W)")
-        return result
+    def read_registers(self, start: int, count: int) -> list:
+        regs = self.build_registers()
+        return [regs.get(start + i, 0) for i in range(count)]
 
-    def setValues(self, address, values):
-        addr = address - 1
-        # Accept write of 1 or 2 registers starting at 0
-        if addr == 0 and len(values) >= 2:
-            value = self._regs_to_float(values[0], values[1])
-            self.main_window.surplus_power = float(value)
-            self.main_window.update_surplus_display()
-            print(f"[Modbus TX] Unit 100 (Global): Write HR 0-1 <- {value:.1f} W")
+    def update(self):
+        if self.total_power_w > 0:
+            self.energy_forward_wh += self.total_power_w / 3600.0
+        elif self.total_power_w < 0:
+            self.energy_reverse_wh += abs(self.total_power_w) / 3600.0
 
 
-class DynamicStationProxy:
-    """Dict-like proxy that maps unit_id → ModbusDeviceContext dynamically.
-    
-    pymodbus ModbusServerContext(single=False) uses `devices[unit_id]` 
-    to look up the datastore for each incoming request.
-    By implementing __getitem__, __contains__, and keys(), this proxy
-    always returns the current live stations from the MainWindow.
-    """
-    
+# ---------------------------------------------------------------------------
+# Combined Modbus TCP server (port 5020)
+# Dispatches by register address range:
+#   start >= 40000  ->  energy meter (em_smartfox_slave.c register map)
+#   start <  40000  ->  charger      (car_cc_debug.c register map)
+# ---------------------------------------------------------------------------
+
+METER_REG_THRESHOLD = 40000
+
+
+class CombinedModbusTCPServer:
+    FC_READ_HOLDING   = 3
+    FC_WRITE_SINGLE   = 6
+    FC_WRITE_MULTIPLE = 16
+
     def __init__(self, main_window):
         self.main_window = main_window
-        self._blocks = {}
+        self._server     = None
 
-    def _get_or_create_block(self, unit_id: int) -> StationDataBlock:
-        station = None
+    @property
+    def meter(self) -> SmartfoxSlaveSimulator:
+        return self.main_window.meter
+
+    async def _handle_client(self, reader, writer):
+        peer = writer.get_extra_info('peername')
+        print(f"[Modbus] Connected: {peer}")
+        try:
+            while True:
+                header   = await reader.readexactly(7)
+                trans_id = struct.unpack_from('>H', header, 0)[0]
+                length   = struct.unpack_from('>H', header, 4)[0]
+                unit_id  = header[6]
+                pdu          = await reader.readexactly(length - 1)
+                func_code    = pdu[0]
+                response_pdu = self._dispatch(unit_id, func_code, pdu[1:])
+                resp_len = len(response_pdu) + 1
+                writer.write(
+                    struct.pack('>HHH', trans_id, 0, resp_len)
+                    + bytes([unit_id]) + response_pdu
+                )
+                await writer.drain()
+        except asyncio.IncompleteReadError:
+            pass
+        except Exception as e:
+            print(f"[Modbus] Client error: {e}")
+        finally:
+            writer.close()
+            print(f"[Modbus] Disconnected: {peer}")
+
+    def _dispatch(self, unit_id, func_code, data):
+        try:
+            start = struct.unpack_from('>H', data, 0)[0]
+
+            if func_code == self.FC_READ_HOLDING:
+                count  = struct.unpack_from('>H', data, 2)[0]
+                if start >= METER_REG_THRESHOLD:
+                    values = self._read_meter(start, count)
+                else:
+                    values = self._read_charger(unit_id, start, count)
+                payload = b''.join(struct.pack('>H', v & 0xFFFF) for v in values)
+                return bytes([func_code, len(payload)]) + payload
+
+            elif func_code == self.FC_WRITE_SINGLE:
+                value = struct.unpack_from('>H', data, 2)[0]
+                self._write_charger(unit_id, start, [value])
+                return bytes([func_code]) + data[:4]
+
+            elif func_code == self.FC_WRITE_MULTIPLE:
+                count  = struct.unpack_from('>H', data, 2)[0]
+                values = [struct.unpack_from('>H', data, 5 + i * 2)[0] for i in range(count)]
+                self._write_charger(unit_id, start, values)
+                return bytes([func_code]) + data[:4]
+
+            else:
+                return bytes([func_code | 0x80, 0x01])
+        except Exception as e:
+            print(f"[Modbus] Dispatch error unit {unit_id} fc {func_code}: {e}")
+            return bytes([func_code | 0x80, 0x04])
+
+    # ---- meter reads ----
+
+    def _read_meter(self, start, count):
+        now = datetime.now().strftime("%H:%M:%S")
+        self.meter.last_request_time = now
+        self.meter.last_request_type = f"FC3 addr={start} qty={count}"
+        result = self.meter.read_registers(start, count)
+        print(f"[Meter RX] Read HR {start} qty {count} -> {result}")
+        return result
+
+    # ---- charger reads / writes ----
+
+    def _get_station(self, unit_id):
         for s in self.main_window.stations:
             if s.station_id == unit_id:
-                station = s
-                break
+                return s
+        return None
+
+    def _read_charger(self, unit_id, start, count):
+        now = datetime.now().strftime("%H:%M:%S")
+        if unit_id == 100:
+            charger_total_w = sum(s.current_power * 1000 for s in self.main_window.stations)
+            result_w = self.main_window.surplus_power + charger_total_w
+            packed   = struct.pack('>f', result_w)
+            high     = (packed[0] << 8) | packed[1]
+            low      = (packed[2] << 8) | packed[3]
+            reg_map  = {0: high, 1: low}
+            result   = [reg_map.get(start + i, 0) for i in range(count)]
+            print(f"[Charger RX] Unit 100: Read HR {start} qty {count} -> {result}")
+            return result
+        station = self._get_station(unit_id)
         if station is None:
-            return None
-        if unit_id not in self._blocks or self._blocks[unit_id].station is not station:
-            self._blocks[unit_id] = StationDataBlock(station)
-        return self._blocks[unit_id]
-    
-    def __getitem__(self, unit_id: int):
+            return [0] * count
+        station.last_request_time = now
+        station.last_request_type = f"Read HR {start} (qty {count})"
+        registers = station.get_modbus_data()
+        result = [registers[start + i] if (start + i) < len(registers) else 0 for i in range(count)]
+        print(f"[Charger RX] Unit {unit_id}: Read HR {start} qty {count} -> {result}")
+        return result
+
+    def _write_charger(self, unit_id, start, values):
+        now = datetime.now().strftime("%H:%M:%S")
         if unit_id == 100:
-            if 100 not in self._blocks:
-                self._blocks[100] = GlobalDataBlock(self.main_window)
-            return ModbusDeviceContext(hr=self._blocks[100])
-        block = self._get_or_create_block(unit_id)
-        if block is None:
-            empty = ModbusSequentialDataBlock(0, [0] * 100)
-            return ModbusDeviceContext(hr=empty)
-        return ModbusDeviceContext(hr=block)
+            if start == 0 and len(values) >= 2:
+                packed = struct.pack('>HH', values[0] & 0xFFFF, values[1] & 0xFFFF)
+                value  = struct.unpack('>f', packed)[0]
+                self.main_window.surplus_power = float(value)
+                print(f"[Charger TX] Unit 100: Write HR 0-1 <- {value:.1f} W")
+            return
+        station = self._get_station(unit_id)
+        if station is None:
+            return
+        station.last_request_time = now
+        station.last_request_type = f"Write HR {start} (qty {len(values)})"
+        print(f"[Charger TX] Unit {unit_id}: Write HR {start} qty {len(values)} <- {values}")
+        for i, value in enumerate(values):
+            station.write_register(start + i, value)
 
-    def __contains__(self, unit_id: int) -> bool:
-        if unit_id == 100:
-            return True
-        return any(s.station_id == unit_id for s in self.main_window.stations)
-
-    def keys(self):
-        return [s.station_id for s in self.main_window.stations] + [100]
+    async def serve(self):
+        self._server = await asyncio.start_server(self._handle_client, '0.0.0.0', 5020)
+        print("[Modbus] Combined server listening on 0.0.0.0:5020")
+        async with self._server:
+            await self._server.serve_forever()
 
 
-class ModbusServerThread(threading.Thread):
-    """Thread for running a single Modbus TCP server for all stations"""
-    
+class CombinedServerThread(threading.Thread):
     def __init__(self, main_window):
         super().__init__(daemon=True)
         self.main_window = main_window
-        self.running = False
-        self.proxy = DynamicStationProxy(main_window)
-        
+        self.running     = False
+
     def run(self):
         self.running = True
-        context = ModbusServerContext(devices=self.proxy, single=False)
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         try:
-            StartTcpServer(context=context, address=("0.0.0.0", 5020))
+            loop.run_until_complete(CombinedModbusTCPServer(self.main_window).serve())
         except Exception as e:
-            print(f"Modbus server error: {e}")
+            print(f"[Modbus] Server error: {e}")
         finally:
             self.running = False
 
-    def get_datastore(self, station_id: int):
-        return self.proxy._get_or_create_block(station_id)
 
+# ---------------------------------------------------------------------------
+# UI widgets
+# ---------------------------------------------------------------------------
 
 class StationWidget(QGroupBox):
-    """UI Widget for a single charging station"""
-    
     def __init__(self, station: ChargingStationSimulator, parent=None):
         super().__init__(f"Station {station.station_id}", parent)
         self.station = station
-        self.window = None # Will be set by MainWindow
+        self.window  = None
         self.setup_ui()
-        
+
     def setup_ui(self):
         layout = QGridLayout()
-        
-        # --- Status Section ---
+
         layout.addWidget(QLabel("<b>Status:</b>"), 0, 0)
         self.status_label = QLabel("Unplugged")
         self.status_label.setStyleSheet("font-weight: bold;")
         layout.addWidget(self.status_label, 0, 1)
-        
+
         btn_layout = QHBoxLayout()
         self.plug_in_btn = QPushButton("Einstecken")
         self.plug_in_btn.clicked.connect(self.on_plug_in)
         btn_layout.addWidget(self.plug_in_btn)
-        
         self.plug_out_btn = QPushButton("Ausstecken")
         self.plug_out_btn.clicked.connect(self.on_plug_out)
         btn_layout.addWidget(self.plug_out_btn)
-        
         self.error_btn = QPushButton("Fehler")
         self.error_btn.clicked.connect(self.on_error)
         btn_layout.addWidget(self.error_btn)
-        
         layout.addLayout(btn_layout, 1, 0, 1, 2)
-        
-        # --- Read-only Values (Monitoring) ---
-        layout.addWidget(QLabel("Power:"), 2, 0)
+
+        layout.addWidget(QLabel("Power:"),       2, 0)
         self.power_label = QLabel("0.0 kW")
-        layout.addWidget(self.power_label, 2, 1)
-        
-        layout.addWidget(QLabel("Voltage:"), 3, 0)
+        layout.addWidget(self.power_label,       2, 1)
+
+        layout.addWidget(QLabel("Voltage:"),     3, 0)
         self.voltage_label = QLabel("230.0 V")
-        layout.addWidget(self.voltage_label, 3, 1)
-        
-        layout.addWidget(QLabel("Current:"), 4, 0)
+        layout.addWidget(self.voltage_label,     3, 1)
+
+        layout.addWidget(QLabel("Current:"),     4, 0)
         self.current_label = QLabel("0.0 A")
-        layout.addWidget(self.current_label, 4, 1)
-        
-        layout.addWidget(QLabel("Energy:"), 5, 0)
+        layout.addWidget(self.current_label,     4, 1)
+
+        layout.addWidget(QLabel("Energy:"),      5, 0)
         self.energy_label = QLabel("0.00 kWh")
-        layout.addWidget(self.energy_label, 5, 1)
-        
+        layout.addWidget(self.energy_label,      5, 1)
+
         layout.addWidget(QLabel("Set Current:"), 6, 0)
         self.set_current_label = QLabel("0 mA")
         layout.addWidget(self.set_current_label, 6, 1)
-        
-        layout.addWidget(QLabel("Phases:"), 7, 0)
+
+        layout.addWidget(QLabel("Phases:"),      7, 0)
         self.phases_label = QLabel("3")
-        layout.addWidget(self.phases_label, 7, 1)
-        
-        # --- Controls (Settings) ---
-        layout.addWidget(QLabel("Max Power:"), 8, 0)
+        layout.addWidget(self.phases_label,      7, 1)
+
+        layout.addWidget(QLabel("Max Power:"),   8, 0)
         self.max_power_spin = QDoubleSpinBox()
         self.max_power_spin.setRange(1.0, 22.0)
         self.max_power_spin.setValue(self.station.max_power)
         self.max_power_spin.setSuffix(" kW")
         self.max_power_spin.valueChanged.connect(self.update_max_power)
-        layout.addWidget(self.max_power_spin, 8, 1)
-        
-        layout.addWidget(QLabel("Amperage:"), 9, 0)
+        layout.addWidget(self.max_power_spin,    8, 1)
+
+        layout.addWidget(QLabel("Amperage:"),    9, 0)
         self.amperage_spin = QDoubleSpinBox()
         self.amperage_spin.setRange(0.0, 32.0)
         self.amperage_spin.setValue(0.0)
         self.amperage_spin.setSuffix(" A")
         self.amperage_spin.valueChanged.connect(self.update_amperage)
-        layout.addWidget(self.amperage_spin, 9, 1)
-        
-        layout.addWidget(QLabel("Manual:"), 10, 0)
+        layout.addWidget(self.amperage_spin,     9, 1)
+
+        layout.addWidget(QLabel("Manual:"),      10, 0)
         self.manual_checkbox = QCheckBox("Manual Override")
         self.manual_checkbox.setChecked(False)
         self.manual_checkbox.stateChanged.connect(self.toggle_manual)
-        layout.addWidget(self.manual_checkbox, 10, 1)
-        
+        layout.addWidget(self.manual_checkbox,   10, 1)
+
         layout.addWidget(QLabel("Last Request:"), 11, 0)
         self.last_req_label = QLabel("None")
         self.last_req_label.setStyleSheet("font-size: 10px; color: gray;")
-        layout.addWidget(self.last_req_label, 11, 1)
-        
+        layout.addWidget(self.last_req_label,    11, 1)
+
         self.setLayout(layout)
-        
+
     def update_display(self):
         status_name = self.station.STATUS_NAMES.get(self.station.status_code, "Unknown")
         self.status_label.setText(status_name)
-        
         if self.station.status_code == ChargingStationSimulator.STATUS_CHARGING:
             self.status_label.setStyleSheet("font-weight: bold; color: orange;")
         elif self.station.status_code == ChargingStationSimulator.STATUS_ERROR:
@@ -458,7 +489,7 @@ class StationWidget(QGroupBox):
             self.status_label.setStyleSheet("font-weight: bold; color: green;")
         else:
             self.status_label.setStyleSheet("font-weight: bold; color: gray;")
-        
+
         connected = self.station.status_code in (
             ChargingStationSimulator.STATUS_CONNECTED,
             ChargingStationSimulator.STATUS_CHARGING
@@ -466,103 +497,196 @@ class StationWidget(QGroupBox):
         self.plug_in_btn.setEnabled(not connected and self.station.status_code != ChargingStationSimulator.STATUS_ERROR)
         self.plug_out_btn.setEnabled(connected)
         self.error_btn.setEnabled(self.station.status_code != ChargingStationSimulator.STATUS_ERROR)
-        
+
         self.power_label.setText(f"{self.station.current_power:.1f} kW")
         self.voltage_label.setText(f"{self.station.voltage:.1f} V")
         self.current_label.setText(f"{self.station.current_amperage:.1f} A")
         self.energy_label.setText(f"{self.station.energy_delivered:.2f} kWh")
-        self.set_current_label.setText(f"{self.station.set_current_ma} mA ({self.station.set_current_ma/1000:.1f} A)")
+        self.set_current_label.setText(
+            f"{self.station.set_current_ma} mA ({self.station.set_current_ma/1000:.1f} A)"
+        )
         self.phases_label.setText(f"{self.station.phases}")
-        
+
         if not self.station.manual_amperage:
             self.amperage_spin.blockSignals(True)
             self.amperage_spin.setValue(self.station.current_amperage)
             self.amperage_spin.blockSignals(False)
-            
-        # Update last modbus request display
-        if self.window.modbus_server_thread and self.window.modbus_server_thread.running:
-            datastore = self.window.modbus_server_thread.get_datastore(self.station.station_id)
-            if datastore:
-                info = f"[{datastore.last_request_time}] {datastore.last_request_type}"
-                self.last_req_label.setText(info)
-        
-    def on_plug_in(self):
-        self.station.plug_in()
-        self.update_display()
-        
-    def on_plug_out(self):
-        self.station.plug_out()
-        self.update_display()
-        
-    def on_error(self):
-        self.station.set_error()
-        self.update_display()
-        
-    def update_max_power(self, value):
-        self.station.max_power = value
-        
+
+        if self.window and self.window.server_thread and self.window.server_thread.running:
+            self.last_req_label.setText(
+                f"[{self.station.last_request_time}] {self.station.last_request_type}"
+            )
+
+    def on_plug_in(self):   self.station.plug_in();  self.update_display()
+    def on_plug_out(self):  self.station.plug_out(); self.update_display()
+    def on_error(self):     self.station.set_error(); self.update_display()
+    def update_max_power(self, value): self.station.max_power = value
     def update_amperage(self, value):
         self.station.set_amperage(value)
         self.station.manual_amperage = True
         self.manual_checkbox.setChecked(True)
-        
     def toggle_manual(self, state):
         self.station.manual_amperage = (state == Qt.CheckState.Checked)
         if not self.station.manual_amperage:
             self.station.set_amperage(self.station.set_current_ma / 1000.0)
 
 
+class MeterWidget(QGroupBox):
+    def __init__(self, meter: SmartfoxSlaveSimulator, parent=None):
+        super().__init__("Smartfox Slave Meter  (port 5020, Unit-ID 1)", parent)
+        self.meter = meter
+        self._setup_ui()
+
+    def _setup_ui(self):
+        layout = QGridLayout()
+        row = 0
+
+        layout.addWidget(QLabel("<b>Total Power (W) [auto]:</b>"), row, 0)
+        self.total_power_spin = QSpinBox()
+        self.total_power_spin.setRange(-99999, 99999)
+        self.total_power_spin.setValue(0)
+        self.total_power_spin.setSuffix(" W")
+        self.total_power_spin.setEnabled(False)
+        layout.addWidget(self.total_power_spin, row, 1, 1, 2)
+        row += 1
+
+        layout.addWidget(QLabel("<b>Phase Powers (W):</b>"), row, 0)
+        row += 1
+        self.phase_power_spins = []
+        for i in range(3):
+            layout.addWidget(QLabel(f"  L{i+1}:"), row, 0)
+            spin = QSpinBox()
+            spin.setRange(-99999, 99999)
+            spin.setValue(0)
+            spin.setSuffix(" W")
+            spin.setEnabled(False)
+            layout.addWidget(spin, row, 1, 1, 2)
+            self.phase_power_spins.append(spin)
+            row += 1
+
+        layout.addWidget(QLabel("<b>Phase Currents (mA):</b>"), row, 0)
+        row += 1
+        self.phase_current_spins = []
+        for i in range(3):
+            layout.addWidget(QLabel(f"  L{i+1}:"), row, 0)
+            spin = QSpinBox()
+            spin.setRange(-999999, 999999)
+            spin.setValue(0)
+            spin.setSuffix(" mA")
+            spin.setEnabled(False)
+            layout.addWidget(spin, row, 1, 1, 2)
+            self.phase_current_spins.append(spin)
+            row += 1
+
+        layout.addWidget(QLabel("<b>Energy Forward:</b>"), row, 0)
+        self.energy_for_label = QLabel("0.000 Wh")
+        layout.addWidget(self.energy_for_label, row, 1)
+        btn = QPushButton("Reset"); btn.setFixedWidth(55)
+        btn.clicked.connect(lambda: setattr(self.meter, 'energy_forward_wh', 0.0))
+        layout.addWidget(btn, row, 2)
+        row += 1
+
+        layout.addWidget(QLabel("<b>Energy Reverse:</b>"), row, 0)
+        self.energy_rev_label = QLabel("0.000 Wh")
+        layout.addWidget(self.energy_rev_label, row, 1)
+        btn2 = QPushButton("Reset"); btn2.setFixedWidth(55)
+        btn2.clicked.connect(lambda: setattr(self.meter, 'energy_reverse_wh', 0.0))
+        layout.addWidget(btn2, row, 2)
+        row += 1
+
+        layout.addWidget(QLabel("Last Request:"), row, 0)
+        self.last_req_label = QLabel("None")
+        self.last_req_label.setStyleSheet("font-size: 10px; color: gray;")
+        layout.addWidget(self.last_req_label, row, 1, 1, 2)
+
+        self.setLayout(layout)
+
+    def _on_total_power(self, v): pass  # driven automatically from surplus + charger sum
+    def _on_phase_power(self, idx, v): pass
+    def _on_phase_current(self, idx, v): pass
+
+    def update_display(self):
+        self.total_power_spin.blockSignals(True)
+        self.total_power_spin.setValue(self.meter.total_power_w)
+        self.total_power_spin.blockSignals(False)
+        for i in range(3):
+            for spin, val in [
+                (self.phase_power_spins[i],   self.meter.phase_powers_w[i]),
+                (self.phase_current_spins[i], self.meter.phase_currents_ma[i]),
+            ]:
+                spin.blockSignals(True)
+                spin.setValue(val)
+                spin.blockSignals(False)
+        self.energy_for_label.setText(f"{self.meter.energy_forward_wh:.3f} Wh")
+        self.energy_rev_label.setText(f"{self.meter.energy_reverse_wh:.3f} Wh")
+        self.last_req_label.setText(
+            f"[{self.meter.last_request_time}] {self.meter.last_request_type}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Main window
+# ---------------------------------------------------------------------------
+
 class MainWindow(QMainWindow):
-    """Main application window"""
-    
+
     def __init__(self):
         super().__init__()
-        self.stations = []
-        self.modbus_server_thread = None
-        self.surplus_power = 0.0  # Globaler PV-Überschuss in Watt (Unit-ID 100, Register 0)
-        self.regulation_logger = RegulationLogger()
+        self.stations      = []
+        self.server_thread = None
+        self.surplus_power = 0.0
+        self.meter         = SmartfoxSlaveSimulator()
         self.setup_ui()
-        self.start_modbus_server()
+        self.start_servers()
         self.start_update_timer()
         self.add_stations()
-        
+
     def setup_ui(self):
-        self.setWindowTitle("EV Charging Station Simulator")
-        self.setGeometry(100, 100, 1200, 800)
-        
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        main_layout = QVBoxLayout(central_widget)
-        
-        control_layout = QHBoxLayout()
-        
-        control_layout.addWidget(QLabel("Number of Stations:"))
+        self.setWindowTitle("EV Charging Station + Smartfox Slave Simulator")
+        self.setGeometry(100, 100, 1200, 900)
+
+        central = QWidget()
+        self.setCentralWidget(central)
+        main_layout = QVBoxLayout(central)
+
+        # ---- IP / server info ----
+        ips = self._get_local_ips()
+        host_ip = "  |  ".join(ips)
+        info_layout = QHBoxLayout()
+        info_layout.addWidget(QLabel(
+            f"Modbus TCP:  <b>{host_ip}:5020</b>"
+            f"   (chargers: unit-ID = station ID  |  meter: addr ≥ 40000)"
+        ))
+        copy_btn = QPushButton("Copy IP")
+        copy_btn.setFixedWidth(70)
+        copy_btn.clicked.connect(lambda: QApplication.clipboard().setText("\n".join(ips)))
+        info_layout.addWidget(copy_btn)
+        info_layout.addStretch()
+        main_layout.addLayout(info_layout)
+
+        # ---- Tabs ----
+        tabs = QTabWidget()
+
+        # Charger tab
+        charger_tab = QWidget()
+        charger_layout = QVBoxLayout(charger_tab)
+
+        ctrl_layout = QHBoxLayout()
+        ctrl_layout.addWidget(QLabel("Number of Stations:"))
         self.station_count_spin = QSpinBox()
         self.station_count_spin.setRange(1, 16)
         self.station_count_spin.setValue(3)
-        control_layout.addWidget(self.station_count_spin)
-        
+        ctrl_layout.addWidget(self.station_count_spin)
         add_btn = QPushButton("Add Stations")
         add_btn.clicked.connect(self.add_stations)
-        control_layout.addWidget(add_btn)
-        
+        ctrl_layout.addWidget(add_btn)
         clear_btn = QPushButton("Clear All")
         clear_btn.clicked.connect(self.clear_stations)
-        control_layout.addWidget(clear_btn)
+        ctrl_layout.addWidget(clear_btn)
 
-        export_log_btn = QPushButton("Export Log")
-        export_log_btn.clicked.connect(self.export_log)
-        control_layout.addWidget(export_log_btn)
-
-        clear_log_btn = QPushButton("Clear Log")
-        clear_log_btn.clicked.connect(self.clear_log)
-        control_layout.addWidget(clear_log_btn)
-        
-        # --- Globaler PV-Überschuss (Unit-ID 100, Register 0) ---
         surplus_group = QGroupBox("PV-Überschuss (Unit-ID 100)")
         surplus_layout = QHBoxLayout()
         surplus_layout.setContentsMargins(6, 4, 6, 4)
-
         self.surplus_spin = QDoubleSpinBox()
         self.surplus_spin.setRange(-32768.0, 32767.0)
         self.surplus_spin.setDecimals(0)
@@ -571,148 +695,140 @@ class MainWindow(QMainWindow):
         self.surplus_spin.setFixedWidth(120)
         self.surplus_spin.valueChanged.connect(self._on_surplus_changed)
         surplus_layout.addWidget(self.surplus_spin)
-
         surplus_layout.addWidget(QLabel("Eingabe:"))
         self.surplus_display = QLabel("0 W")
         self.surplus_display.setStyleSheet("font-family: monospace; color: #444;")
         surplus_layout.addWidget(self.surplus_display)
-
         surplus_layout.addWidget(QLabel("→  Ausgabe:"))
         self.surplus_result_label = QLabel("0 W")
         self.surplus_result_label.setStyleSheet("font-family: monospace; font-weight: bold; color: #1a7a1a;")
         surplus_layout.addWidget(self.surplus_result_label)
-
         surplus_group.setLayout(surplus_layout)
-        control_layout.addWidget(surplus_group)
+        ctrl_layout.addWidget(surplus_group)
+        ctrl_layout.addStretch()
+        charger_layout.addLayout(ctrl_layout)
 
-        control_layout.addStretch()
-
-        ips = []
-        try:
-            for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
-                ip = info[4][0]
-                if not ip.startswith("127.") and ip not in ips:
-                    ips.append(ip)
-        except Exception:
-            pass
-        if not ips:
-            ips = ["127.0.0.1"]
-        host_ip = "  |  ".join(ips)
-        server_label = QLabel(f"Modbus TCP:  <b>{host_ip}:5020</b>")
-        server_label.setStyleSheet("color: #444; font-family: monospace; padding: 0 8px;")
-        control_layout.addWidget(server_label)
-
-        copy_btn = QPushButton("Copy IP")
-        copy_btn.setFixedWidth(70)
-        copy_btn.clicked.connect(lambda: QApplication.clipboard().setText("\n".join(ips)))
-        control_layout.addWidget(copy_btn)
-
-        main_layout.addLayout(control_layout)
-        
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.stations_container = QWidget()
         self.stations_layout = QGridLayout(self.stations_container)
         self.scroll.setWidget(self.stations_container)
-        main_layout.addWidget(self.scroll)
-        
+        charger_layout.addWidget(self.scroll)
+
+        tabs.addTab(charger_tab, "Chargers (port 5020)")
+
+        # Meter tab
+        meter_tab = QWidget()
+        meter_layout = QVBoxLayout(meter_tab)
+        self.meter_widget = MeterWidget(self.meter)
+        meter_layout.addWidget(self.meter_widget)
+        meter_layout.addStretch()
+        tabs.addTab(meter_tab, "Energy Meter (addr ≥ 40000)")
+
+        main_layout.addWidget(tabs)
+
+    @staticmethod
+    def _get_local_ips():
+        ips = []
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ips.append(s.getsockname()[0])
+            s.close()
+        except Exception:
+            pass
+        if not ips:
+            try:
+                for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+                    ip = info[4][0]
+                    if not ip.startswith("127.") and ip not in ips:
+                        ips.append(ip)
+            except Exception:
+                pass
+        return ips or ["127.0.0.1"]
+
     def add_stations(self):
-        count = self.station_count_spin.value()
+        count    = self.station_count_spin.value()
         start_id = len(self.stations) + 1
-        
         for i in range(count):
             station_id = start_id + i
-            station = ChargingStationSimulator(station_id)
+            station    = ChargingStationSimulator(station_id)
             self.stations.append(station)
-            
-            row = len(self.stations) // 4
-            col = (len(self.stations) - 1) % 4
+            row    = len(self.stations) // 4
+            col    = (len(self.stations) - 1) % 4
             widget = StationWidget(station)
             widget.window = self
             self.stations_layout.addWidget(widget, row, col)
-            
-    def start_modbus_server(self):
-        if self.modbus_server_thread and self.modbus_server_thread.running:
-            return
-        self.modbus_server_thread = ModbusServerThread(self)
-        self.modbus_server_thread.start()
-        
+
     def clear_stations(self):
         self.stations.clear()
-        
         while self.stations_layout.count():
-            item = self.stations_layout.takeAt(0)
+            item   = self.stations_layout.takeAt(0)
             widget = item.widget()
             if widget:
                 widget.deleteLater()
-                
+
+    def start_servers(self):
+        self.server_thread = CombinedServerThread(self)
+        self.server_thread.start()
+
     def start_update_timer(self):
         self.timer = QTimer()
-        self.timer.timeout.connect(self.update_stations)
+        self.timer.timeout.connect(self.update_all)
         self.timer.start(1000)
-        
+
     def _on_surplus_changed(self, value: float):
         self.surplus_power = value
         self.update_surplus_display()
 
+    def _compute_phase_values(self, charger_total_w: float):
+        """Build per-phase power (W) and current (mA) from chargers + positive surplus."""
+        phase_powers   = [0, 0, 0]
+        phase_currents = [0, 0, 0]
+
+        # Positive surplus: spread evenly across all 3 phases
+        if self.surplus_power > 0:
+            per_phase = int(self.surplus_power / 3)
+            for i in range(3):
+                phase_powers[i] += per_phase
+
+        for s in self.stations:
+            if not s.is_charging:
+                continue
+            power_w    = int(s.current_amperage * s.voltage)  # W on each active phase
+            current_ma = int(s.current_amperage * 1000)
+            indices    = range(s.phases)                       # [0] or [0,1,2]
+            for i in indices:
+                phase_powers[i]   += power_w
+                phase_currents[i] += current_ma
+
+        self.meter.phase_powers_w    = phase_powers
+        self.meter.phase_currents_ma = phase_currents
+
     def update_surplus_display(self):
-        """Aktualisiert die Anzeige und synchronisiert den SpinBox-Wert."""
         self.surplus_display.setText(f"{int(self.surplus_power):+d} W")
         self.surplus_spin.blockSignals(True)
         self.surplus_spin.setValue(self.surplus_power)
         self.surplus_spin.blockSignals(False)
-        self._refresh_surplus_result()
-
-    def _refresh_surplus_result(self):
         charger_total_w = sum(s.current_power * 1000 for s in self.stations)
-        result_w = int(self.get_surplus_output_w())
+        result_w        = int(self.surplus_power + charger_total_w)
         self.surplus_result_label.setText(f"{result_w:+d} W")
+        self.meter.total_power_w = result_w
+        self._compute_phase_values(charger_total_w)
 
-    def get_surplus_output_w(self) -> float:
-        charger_total_w = sum(s.current_power * 1000 for s in self.stations)
-        return self.surplus_power + charger_total_w
-
-    def log_regulation_state(self):
-        self.regulation_logger.log(
-            surplus_input_w=self.surplus_power,
-            surplus_output_w=self.get_surplus_output_w(),
-            stations=self.stations,
-        )
-
-    def export_log(self):
-        default_name = self.regulation_logger.path.name
-        target_path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Export Log",
-            str(self.regulation_logger.path.with_name(default_name)),
-            "JSON Lines (*.jsonl);;All Files (*)",
-        )
-        if not target_path:
-            return
-        self.regulation_logger.export_to(target_path)
-        QMessageBox.information(self, "Log exportiert", f"Log exportiert nach:\n{target_path}")
-
-    def clear_log(self):
-        self.regulation_logger.clear()
-        QMessageBox.information(
-            self,
-            "Log geleert",
-            f"Aktuelles Log geleert:\n{self.regulation_logger.path}",
-        )
-
-    def update_stations(self):
+    def update_all(self):
         for station in self.stations:
             station.update()
-
         for widget in self.findChildren(StationWidget):
             widget.update_display()
 
-        self._refresh_surplus_result()
-        self.log_regulation_state()
+        self.meter.update()          # energy accumulation uses total_power_w from last cycle
+        self.update_surplus_display()  # set new total + phase values for this cycle
+        self.meter_widget.update_display()
 
 
 def main():
-    app = QApplication(sys.argv)
+    app    = QApplication(sys.argv)
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
