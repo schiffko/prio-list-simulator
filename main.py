@@ -650,16 +650,18 @@ class MainWindow(QMainWindow):
         main_layout = QVBoxLayout(central)
 
         # ---- IP / server info ----
-        ips = self._get_local_ips()
-        host_ip = "  |  ".join(ips)
+        self.available_ips = self._get_local_ips()
         info_layout = QHBoxLayout()
-        info_layout.addWidget(QLabel(
-            f"Modbus TCP:  <b>{host_ip}:5020</b>"
-            f"   (chargers: unit-ID = station ID  |  meter: addr ≥ 40000)"
-        ))
-        copy_btn = QPushButton("Copy IP")
-        copy_btn.setFixedWidth(70)
-        copy_btn.clicked.connect(lambda: QApplication.clipboard().setText("\n".join(ips)))
+        info_layout.addWidget(QLabel("Modbus TCP:"))
+        self.ip_combo = QComboBox()
+        self.ip_combo.addItems(self.available_ips)
+        self.ip_combo.setFixedWidth(150)
+        self.ip_combo.currentTextChanged.connect(self._on_ip_changed)
+        info_layout.addWidget(self.ip_combo)
+        info_layout.addWidget(QLabel(":5020   (chargers: unit-ID = station ID  |  meter: addr ≥ 40000)"))
+        copy_btn = QPushButton("Copy")
+        copy_btn.setFixedWidth(50)
+        copy_btn.clicked.connect(self._copy_ip)
         info_layout.addWidget(copy_btn)
         info_layout.addStretch()
         main_layout.addLayout(info_layout)
@@ -729,14 +731,26 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _get_local_ips():
+        """Return all non-loopback IPv4 addresses from all network interfaces."""
+        import netifaces
         ips = []
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            ips.append(s.getsockname()[0])
-            s.close()
+            for iface in netifaces.interfaces():
+                addrs = netifaces.ifaddresses(iface)
+                if netifaces.AF_INET in addrs:
+                    for addr in addrs[netifaces.AF_INET]:
+                        ip = addr.get('addr', '')
+                        if ip and not ip.startswith("127."):
+                            ips.append(ip)
         except Exception:
-            pass
+            # Fallback: use socket method
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.connect(("8.8.8.8", 80))
+                ips.append(s.getsockname()[0])
+                s.close()
+            except Exception:
+                pass
         if not ips:
             try:
                 for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
@@ -776,6 +790,14 @@ class MainWindow(QMainWindow):
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_all)
         self.timer.start(1000)
+
+    def _on_ip_changed(self, ip: str):
+        """Handle IP selection change."""
+        pass  # Currently just for display; can be used for binding if needed
+
+    def _copy_ip(self):
+        """Copy selected IP to clipboard."""
+        QApplication.clipboard().setText(self.ip_combo.currentText())
 
     def _on_surplus_changed(self, value: float):
         self.surplus_power = value
