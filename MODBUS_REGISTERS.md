@@ -22,6 +22,7 @@ Jede Ladestation wird über dieselbe IP/Port-Adresse erreicht, differenzert übe
 | Station 3 | 5020 | 3 |
 | Station N | 5020 | N |
 | **Global (Überschuss)** | **5020** | **100** |
+| **Victron Battery** | **5020** | **242** |
 
 ### Netzwerk
 
@@ -46,6 +47,35 @@ Der Server ist über alle Netzwerkinterfaces erreichbar, z.B.:
 | 7 | Error Code | UINT16 | - | 1 | R | 0-255 |
 | 8-9 | Set Current | UINT32 | mA | 1 | R/W | 0-32000 |
 | 10 | Phases | UINT16 | - | 1 | R/W | 1, 3 |
+
+---
+
+## Victron-Batterie-Register (Unit-ID 242)
+
+Geeignet für `BS_ID_VICTRON_VE_CTRL` bei testweise auf `5020` gesetztem Port.
+
+| Adresse | Name | Typ | Einheit | Skala | Zugriff | Wertebereich |
+|---------|------|-----|---------|-------|---------|--------------|
+| 26-27 | Battery Power | INT16 × INT16 | W | `reg26 * reg27 / 1000` | R | ca. ±32767 |
+| 37 | Setpoint L1 | INT16 | W | 1 | W | ca. ±32767 |
+| 40 | Setpoint L2 | INT16 | W | 1 | W | ca. ±32767 |
+| 41 | Setpoint L3 | INT16 | W | 1 | W | ca. ±32767 |
+| 61 | Temperature | INT16 | °C | 0.1 | R | -40.0 bis 100.0 |
+| 843 | SoC | UINT16 | % | 1 | R | 0-100 |
+
+### Victron-Beispiel lesen
+
+```python
+soc = client.read_holding_registers(address=843, count=1, device_id=242).registers[0]
+power_regs = client.read_holding_registers(address=26, count=2, device_id=242).registers
+temp_reg = client.read_holding_registers(address=61, count=1, device_id=242).registers[0]
+
+def to_i16(v):
+    return v if v < 0x8000 else v - 0x10000
+
+power_w = to_i16(power_regs[0]) * to_i16(power_regs[1]) / 1000
+temp_c = to_i16(temp_reg) / 10.0
+```
 
 ---
 

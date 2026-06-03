@@ -96,6 +96,54 @@ class ChargingStationClient:
         print("="*50 + "\n")
 
 
+class BatteryClient:
+    """Client für die simulierte Victron-Batterie"""
+
+    def __init__(self, host: str, unit_id: int = 242):
+        self.host = host
+        self.unit_id = unit_id
+        self.port = 5020
+        self.client = ModbusTcpClient(host, port=self.port)
+
+    def connect(self):
+        print(f"Verbinde zu Battery @ {self.host}:{self.port} (Unit {self.unit_id})")
+        self.client.connect()
+
+    def disconnect(self):
+        self.client.close()
+        print("Verbindung getrennt")
+
+    def read_all_registers(self) -> dict:
+        soc = self.client.read_holding_registers(843, count=1, device_id=self.unit_id).registers[0]
+        power_regs = self.client.read_holding_registers(26, count=2, device_id=self.unit_id).registers
+        raw_temp = self.client.read_holding_registers(61, count=1, device_id=self.unit_id).registers[0]
+
+        def to_i16(v):
+            return v if v < 0x8000 else v - 0x10000
+
+        raw_power = int(to_i16(power_regs[0]) * to_i16(power_regs[1]) / 1000)
+
+        return {
+            'power_w': raw_power,
+            'soc_percent': soc,
+            'temperature_c': raw_temp / 10.0,
+        }
+
+    def set_power_w(self, power_w: int):
+        reg = power_w & 0xFFFF
+        self.client.write_registers(37, [reg], device_id=self.unit_id)
+
+    def print_status(self):
+        status = self.read_all_registers()
+        print("\n" + "="*50)
+        print("Battery Status")
+        print("="*50)
+        print(f"Power:         {status['power_w']} W")
+        print(f"SoC:           {status['soc_percent']} %")
+        print(f"Temperature:   {status['temperature_c']:.1f} C")
+        print("="*50 + "\n")
+
+
 def test_single_station():
     """Test einer einzelnen Station"""
     print("\n" + "="*60)
@@ -183,6 +231,24 @@ def test_multiple_stations():
             station.disconnect()
 
 
+def test_battery():
+    print("\n" + "="*60)
+    print("TEST: Victron Battery")
+    print("="*60)
+
+    battery = BatteryClient('127.0.0.1')
+    try:
+        battery.connect()
+        time.sleep(0.5)
+        battery.print_status()
+        print("Setze Sollleistung auf 2500 W:")
+        battery.set_power_w(2500)
+        time.sleep(1.5)
+        battery.print_status()
+    finally:
+        battery.disconnect()
+
+
 if __name__ == "__main__":
     import sys
     
@@ -191,6 +257,8 @@ if __name__ == "__main__":
     
     if len(sys.argv) > 1 and sys.argv[1] == "multi":
         test_multiple_stations()
+    elif len(sys.argv) > 1 and sys.argv[1] == "battery":
+        test_battery()
     else:
         test_single_station()
     

@@ -1,5 +1,5 @@
 """
-EV Charging Station + Smartfox Slave Energy Meter Simulator
+EV Charging Station + Smartfox Slave Energy Meter + Victron Battery Simulator
 
 Charger simulation  (port 5020, unit-IDs = station IDs):
   Implements the register map expected by car_cc_debug.c
@@ -232,6 +232,78 @@ class SmartfoxSlaveSimulator:
             self.energy_reverse_wh += abs(self.total_power_w) / 3600.0
 
 
+class ModbusTcpBatterySimulator:
+    """Simple Victron VE battery model for bs_victron.c"""
+
+    REG_SOC = 843
+    REG_POWER = 26
+    REG_TEMP = 61
+    REG_SETPOINT_L1 = 37
+    REG_SETPOINT_L2 = 40
+    REG_SETPOINT_L3 = 41
+
+    def __init__(self, unit_id: int = 242):
+        self.unit_id = unit_id
+        self.power_w = 0
+        self.soc_percent = 50
+        self.temperature_c = 23.5
+        self.setpoint_l1_w = 0
+        self.setpoint_l2_w = 0
+        self.setpoint_l3_w = 0
+        self.target_power_w = 0
+        self.power_source_scale = 1000
+        self.last_request_time = "Never"
+        self.last_request_type = "None"
+
+    @staticmethod
+    def _to_u16(value: int) -> int:
+        return value & 0xFFFF
+
+    def read_registers(self, start: int, count: int) -> list:
+        regs = {}
+        regs[self.REG_SOC] = self._to_u16(int(self.soc_percent))
+        regs[self.REG_POWER] = self._to_u16(self.power_source_scale)
+        regs[self.REG_POWER + 1] = self._to_u16(int(self.power_w))
+        regs[self.REG_TEMP] = self._to_u16(int(round(self.temperature_c * 10.0)))
+        regs[self.REG_SETPOINT_L1] = self._to_u16(self.setpoint_l1_w)
+        regs[self.REG_SETPOINT_L2] = self._to_u16(self.setpoint_l2_w)
+        regs[self.REG_SETPOINT_L3] = self._to_u16(self.setpoint_l3_w)
+        return [regs.get(start + i, 0) for i in range(count)]
+
+    def write_register(self, address: int, value: int) -> bool:
+        signed = value if value < 0x8000 else value - 0x10000
+
+        if address == self.REG_SOC:
+            self.soc_percent = max(0, min(100, signed))
+            return True
+        if address == self.REG_TEMP:
+            self.temperature_c = signed / 10.0
+            return True
+        if address == self.REG_SETPOINT_L1:
+            self.setpoint_l1_w = signed
+            self.target_power_w = signed
+            return True
+        if address == self.REG_SETPOINT_L2:
+            self.setpoint_l2_w = signed
+            self.target_power_w = signed
+            return True
+        if address == self.REG_SETPOINT_L3:
+            self.setpoint_l3_w = signed
+            self.target_power_w = signed
+            return True
+        return False
+
+    def update(self):
+        diff = self.target_power_w - self.power_w
+        if diff == 0:
+            return
+        step = 250 if diff > 0 else -250
+        if abs(diff) <= abs(step):
+            self.power_w = self.target_power_w
+        else:
+            self.power_w += step
+
+
 # ---------------------------------------------------------------------------
 # Combined Modbus TCP server (port 5020)
 # Dispatches by register address range:
@@ -240,6 +312,8 @@ class SmartfoxSlaveSimulator:
 # ---------------------------------------------------------------------------
 
 METER_REG_THRESHOLD = 40000
+BATTERY_UNIT_ID = 242
+BATTERY_SYSTEM_UNIT_ID = 0
 
 
 class CombinedModbusTCPServer:
@@ -254,6 +328,10 @@ class CombinedModbusTCPServer:
     @property
     def meter(self) -> SmartfoxSlaveSimulator:
         return self.main_window.meter
+
+    @property
+    def battery(self) -> ModbusTcpBatterySimulator:
+        return self.main_window.battery
 
     async def _handle_client(self, reader, writer):
         peer = writer.get_extra_info('peername')
@@ -331,6 +409,12 @@ class CombinedModbusTCPServer:
 
     def _read_charger(self, unit_id, start, count):
         now = datetime.now().strftime("%H:%M:%S")
+        if unit_id in (BATTERY_UNIT_ID, BATTERY_SYSTEM_UNIT_ID):
+            self.battery.last_request_time = now
+            self.battery.last_request_type = f"Read HR {start} (qty {count}, unit {unit_id})"
+            result = self.battery.read_registers(start, count)
+            print(f"[Battery RX] Unit {unit_id}: Read HR {start} qty {count} -> {result}")
+            return result
         if unit_id == 100:
             charger_total_w = sum(s.current_power * 1000 for s in self.main_window.stations)
             result_w = self.main_window.surplus_power + charger_total_w
@@ -353,6 +437,13 @@ class CombinedModbusTCPServer:
 
     def _write_charger(self, unit_id, start, values):
         now = datetime.now().strftime("%H:%M:%S")
+        if unit_id == BATTERY_UNIT_ID:
+            self.battery.last_request_time = now
+            self.battery.last_request_type = f"Write HR {start} (qty {len(values)})"
+            print(f"[Battery TX] Unit {unit_id}: Write HR {start} qty {len(values)} <- {values}")
+            for i, value in enumerate(values):
+                self.battery.write_register(start + i, value)
+            return
         if unit_id == 100:
             if start == 0 and len(values) >= 2:
                 packed = struct.pack('>HH', values[0] & 0xFFFF, values[1] & 0xFFFF)
@@ -624,6 +715,99 @@ class MeterWidget(QGroupBox):
         )
 
 
+class BatteryWidget(QGroupBox):
+    def __init__(self, battery: ModbusTcpBatterySimulator, parent=None):
+        super().__init__(f"Victron Battery (port 5020, Unit-ID {battery.unit_id})", parent)
+        self.battery = battery
+        self._setup_ui()
+
+    def _setup_ui(self):
+        layout = QGridLayout()
+
+        layout.addWidget(QLabel("Measured Power:"), 0, 0)
+        self.power_spin = QSpinBox()
+        self.power_spin.setRange(-50000, 50000)
+        self.power_spin.setValue(self.battery.power_w)
+        self.power_spin.setSuffix(" W")
+        self.power_spin.valueChanged.connect(self._on_power_changed)
+        layout.addWidget(self.power_spin, 0, 1)
+
+        layout.addWidget(QLabel("SoC:"), 1, 0)
+        self.soc_spin = QSpinBox()
+        self.soc_spin.setRange(0, 100)
+        self.soc_spin.setValue(self.battery.soc_percent)
+        self.soc_spin.setSuffix(" %")
+        self.soc_spin.valueChanged.connect(self._on_soc_changed)
+        layout.addWidget(self.soc_spin, 1, 1)
+
+        layout.addWidget(QLabel("Temperature:"), 2, 0)
+        self.temp_spin = QDoubleSpinBox()
+        self.temp_spin.setRange(-40.0, 100.0)
+        self.temp_spin.setDecimals(1)
+        self.temp_spin.setValue(self.battery.temperature_c)
+        self.temp_spin.setSuffix(" C")
+        self.temp_spin.valueChanged.connect(self._on_temp_changed)
+        layout.addWidget(self.temp_spin, 2, 1)
+
+        layout.addWidget(QLabel("Target Power:"), 3, 0)
+        self.target_label = QLabel("0 W")
+        self.target_label.setStyleSheet("font-family: monospace;")
+        layout.addWidget(self.target_label, 3, 1)
+
+        layout.addWidget(QLabel("Setpoints:"), 4, 0)
+        self.setpoint_label = QLabel("-")
+        self.setpoint_label.setStyleSheet("font-family: monospace;")
+        layout.addWidget(self.setpoint_label, 4, 1)
+
+        layout.addWidget(QLabel("Registers:"), 5, 0)
+        self.reg_label = QLabel("-")
+        self.reg_label.setStyleSheet("font-family: monospace;")
+        layout.addWidget(self.reg_label, 5, 1)
+
+        layout.addWidget(QLabel("Last Request:"), 6, 0)
+        self.last_req_label = QLabel("None")
+        self.last_req_label.setStyleSheet("font-size: 10px; color: gray;")
+        layout.addWidget(self.last_req_label, 6, 1)
+
+        self.setLayout(layout)
+
+    def _on_power_changed(self, value: int):
+        self.battery.power_w = value
+
+    def _on_soc_changed(self, value: int):
+        self.battery.soc_percent = value
+
+    def _on_temp_changed(self, value: float):
+        self.battery.temperature_c = value
+
+    def update_display(self):
+        self.power_spin.blockSignals(True)
+        self.power_spin.setValue(self.battery.power_w)
+        self.power_spin.blockSignals(False)
+
+        self.soc_spin.blockSignals(True)
+        self.soc_spin.setValue(self.battery.soc_percent)
+        self.soc_spin.blockSignals(False)
+
+        self.temp_spin.blockSignals(True)
+        self.temp_spin.setValue(self.battery.temperature_c)
+        self.temp_spin.blockSignals(False)
+
+        reg_soc = self.battery.read_registers(self.battery.REG_SOC, 1)[0]
+        reg_power = self.battery.read_registers(self.battery.REG_POWER, 2)
+        reg_temp = self.battery.read_registers(self.battery.REG_TEMP, 1)[0]
+        self.target_label.setText(f"{self.battery.target_power_w} W")
+        self.setpoint_label.setText(
+            f"L1={self.battery.setpoint_l1_w} L2={self.battery.setpoint_l2_w} L3={self.battery.setpoint_l3_w}"
+        )
+        self.reg_label.setText(
+            f"843={reg_soc}  26={reg_power[0]} 27={reg_power[1]}  61={reg_temp}"
+        )
+        self.last_req_label.setText(
+            f"[{self.battery.last_request_time}] {self.battery.last_request_type}"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Main window
 # ---------------------------------------------------------------------------
@@ -636,13 +820,14 @@ class MainWindow(QMainWindow):
         self.server_thread = None
         self.surplus_power = 0.0
         self.meter         = SmartfoxSlaveSimulator()
+        self.battery       = ModbusTcpBatterySimulator()
         self.setup_ui()
         self.start_servers()
         self.start_update_timer()
         self.add_stations()
 
     def setup_ui(self):
-        self.setWindowTitle("EV Charging Station + Smartfox Slave Simulator")
+        self.setWindowTitle("EV Charging Station + Smartfox Slave + Victron Battery Simulator")
         self.setGeometry(100, 100, 1200, 900)
 
         central = QWidget()
@@ -658,7 +843,7 @@ class MainWindow(QMainWindow):
         self.ip_combo.setFixedWidth(150)
         self.ip_combo.currentTextChanged.connect(self._on_ip_changed)
         info_layout.addWidget(self.ip_combo)
-        info_layout.addWidget(QLabel(":5020   (chargers: unit-ID = station ID  |  meter: addr ≥ 40000)"))
+        info_layout.addWidget(QLabel(":5020   (chargers: unit-ID = station ID  |  Victron battery: unit-ID 242  |  meter: addr ≥ 40000)"))
         copy_btn = QPushButton("Copy")
         copy_btn.setFixedWidth(50)
         copy_btn.clicked.connect(self._copy_ip)
@@ -726,6 +911,14 @@ class MainWindow(QMainWindow):
         meter_layout.addWidget(self.meter_widget)
         meter_layout.addStretch()
         tabs.addTab(meter_tab, "Energy Meter (addr ≥ 40000)")
+
+        # Battery tab
+        battery_tab = QWidget()
+        battery_layout = QVBoxLayout(battery_tab)
+        self.battery_widget = BatteryWidget(self.battery)
+        battery_layout.addWidget(self.battery_widget)
+        battery_layout.addStretch()
+        tabs.addTab(battery_tab, "Victron Battery (Unit-ID 242)")
 
         main_layout.addWidget(tabs)
 
@@ -803,8 +996,8 @@ class MainWindow(QMainWindow):
         self.surplus_power = value
         self.update_surplus_display()
 
-    def _compute_phase_values(self, charger_total_w: float):
-        """Build per-phase power (W) and current (mA) from chargers + positive surplus."""
+    def _compute_phase_values(self):
+        """Build per-phase power (W) and current (mA) from chargers, battery and positive surplus."""
         phase_powers   = [0, 0, 0]
         phase_currents = [0, 0, 0]
 
@@ -824,6 +1017,22 @@ class MainWindow(QMainWindow):
                 phase_powers[i]   += power_w
                 phase_currents[i] += current_ma
 
+        battery_phase_indices = []
+        if self.battery.setpoint_l1_w != 0:
+            battery_phase_indices.append(0)
+        if self.battery.setpoint_l2_w != 0:
+            battery_phase_indices.append(1)
+        if self.battery.setpoint_l3_w != 0:
+            battery_phase_indices.append(2)
+        if not battery_phase_indices:
+            battery_phase_indices = [0]
+
+        battery_power_per_phase = int(self.battery.power_w / len(battery_phase_indices))
+        battery_current_ma = int((battery_power_per_phase / 230.0) * 1000.0)
+        for i in battery_phase_indices:
+            phase_powers[i] += battery_power_per_phase
+            phase_currents[i] += battery_current_ma
+
         self.meter.phase_powers_w    = phase_powers
         self.meter.phase_currents_ma = phase_currents
 
@@ -833,20 +1042,23 @@ class MainWindow(QMainWindow):
         self.surplus_spin.setValue(self.surplus_power)
         self.surplus_spin.blockSignals(False)
         charger_total_w = sum(s.current_power * 1000 for s in self.stations)
-        result_w        = int(self.surplus_power + charger_total_w)
+        battery_total_w = self.battery.power_w
+        result_w        = int(self.surplus_power + charger_total_w + battery_total_w)
         self.surplus_result_label.setText(f"{result_w:+d} W")
         self.meter.total_power_w = result_w
-        self._compute_phase_values(charger_total_w)
+        self._compute_phase_values()
 
     def update_all(self):
         for station in self.stations:
             station.update()
+        self.battery.update()
         for widget in self.findChildren(StationWidget):
             widget.update_display()
 
         self.meter.update()          # energy accumulation uses total_power_w from last cycle
         self.update_surplus_display()  # set new total + phase values for this cycle
         self.meter_widget.update_display()
+        self.battery_widget.update_display()
 
 
 def main():
