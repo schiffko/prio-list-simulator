@@ -64,6 +64,7 @@ class ChargingStationSimulator:
         self.max_amperage     = 32.0
         self.voltage          = 230.0
         self.phases           = 3
+        self.vehicle_phases   = 3
         self.energy_delivered = 0.0
         self.session_duration = 0
         self.status_code      = 0
@@ -78,6 +79,10 @@ class ChargingStationSimulator:
     def status(self):
         return self.STATUS_NAMES.get(self.status_code, "Unknown")
 
+    @property
+    def effective_phases(self):
+        return min(self.phases, self.vehicle_phases)
+
     def get_modbus_data(self) -> list:
         self.registers[0]  = self.status_code
         self.registers[1]  = int(self.current_power * 10)
@@ -90,6 +95,7 @@ class ChargingStationSimulator:
         self.registers[8]  = self.set_current_ma & 0xFFFF
         self.registers[9]  = (self.set_current_ma >> 16) & 0xFFFF
         self.registers[10] = self.phases
+        self.registers[11] = self.vehicle_phases
         return self.registers
 
     def write_register(self, address: int, value: int) -> bool:
@@ -166,7 +172,7 @@ class ChargingStationSimulator:
                     self.current_amperage = self.target_amperage
                 else:
                     self.current_amperage += step
-            self.current_power     = self.current_amperage * self.voltage * self.phases / 1000
+            self.current_power     = self.current_amperage * self.voltage * self.effective_phases / 1000
             self.energy_delivered += (self.current_power / 3600)
             if self.current_amperage == 0.0 and self.target_amperage == 0.0:
                 self.is_charging   = False
@@ -536,36 +542,47 @@ class StationWidget(QGroupBox):
         self.set_current_label = QLabel("0 mA")
         layout.addWidget(self.set_current_label, 6, 1)
 
-        layout.addWidget(QLabel("Phases:"),      7, 0)
+        layout.addWidget(QLabel("Station Phases:"), 7, 0)
         self.phases_label = QLabel("3")
         layout.addWidget(self.phases_label,      7, 1)
 
-        layout.addWidget(QLabel("Max Power:"),   8, 0)
+        layout.addWidget(QLabel("Vehicle Phases:"), 8, 0)
+        self.vehicle_phases_combo = QComboBox()
+        self.vehicle_phases_combo.addItems(["1", "2", "3"])
+        self.vehicle_phases_combo.setCurrentIndex(2)
+        self.vehicle_phases_combo.currentIndexChanged.connect(self.update_vehicle_phases)
+        layout.addWidget(self.vehicle_phases_combo, 8, 1)
+
+        layout.addWidget(QLabel("Eff. Phases:"), 9, 0)
+        self.eff_phases_label = QLabel("3")
+        layout.addWidget(self.eff_phases_label,  9, 1)
+
+        layout.addWidget(QLabel("Max Power:"),   10, 0)
         self.max_power_spin = QDoubleSpinBox()
         self.max_power_spin.setRange(1.0, 22.0)
         self.max_power_spin.setValue(self.station.max_power)
         self.max_power_spin.setSuffix(" kW")
         self.max_power_spin.valueChanged.connect(self.update_max_power)
-        layout.addWidget(self.max_power_spin,    8, 1)
+        layout.addWidget(self.max_power_spin,    10, 1)
 
-        layout.addWidget(QLabel("Amperage:"),    9, 0)
+        layout.addWidget(QLabel("Amperage:"),    11, 0)
         self.amperage_spin = QDoubleSpinBox()
         self.amperage_spin.setRange(0.0, 32.0)
         self.amperage_spin.setValue(0.0)
         self.amperage_spin.setSuffix(" A")
         self.amperage_spin.valueChanged.connect(self.update_amperage)
-        layout.addWidget(self.amperage_spin,     9, 1)
+        layout.addWidget(self.amperage_spin,     11, 1)
 
-        layout.addWidget(QLabel("Manual:"),      10, 0)
+        layout.addWidget(QLabel("Manual:"),      12, 0)
         self.manual_checkbox = QCheckBox("Manual Override")
         self.manual_checkbox.setChecked(False)
         self.manual_checkbox.stateChanged.connect(self.toggle_manual)
-        layout.addWidget(self.manual_checkbox,   10, 1)
+        layout.addWidget(self.manual_checkbox,   12, 1)
 
-        layout.addWidget(QLabel("Last Request:"), 11, 0)
+        layout.addWidget(QLabel("Last Request:"), 13, 0)
         self.last_req_label = QLabel("None")
         self.last_req_label.setStyleSheet("font-size: 10px; color: gray;")
-        layout.addWidget(self.last_req_label,    11, 1)
+        layout.addWidget(self.last_req_label,    13, 1)
 
         self.setLayout(layout)
 
@@ -598,6 +615,11 @@ class StationWidget(QGroupBox):
         )
         self.phases_label.setText(f"{self.station.phases}")
 
+        self.vehicle_phases_combo.blockSignals(True)
+        self.vehicle_phases_combo.setCurrentIndex(self.station.vehicle_phases - 1)
+        self.vehicle_phases_combo.blockSignals(False)
+        self.eff_phases_label.setText(f"{self.station.effective_phases}")
+
         if not self.station.manual_amperage:
             self.amperage_spin.blockSignals(True)
             self.amperage_spin.setValue(self.station.current_amperage)
@@ -612,6 +634,7 @@ class StationWidget(QGroupBox):
     def on_plug_out(self):  self.station.plug_out(); self.update_display()
     def on_error(self):     self.station.set_error(); self.update_display()
     def update_max_power(self, value): self.station.max_power = value
+    def update_vehicle_phases(self, index): self.station.vehicle_phases = index + 1
     def update_amperage(self, value):
         self.station.set_amperage(value)
         self.station.manual_amperage = True
@@ -1012,7 +1035,7 @@ class MainWindow(QMainWindow):
                 continue
             power_w    = int(s.current_amperage * s.voltage)  # W on each active phase
             current_ma = int(s.current_amperage * 1000)
-            indices    = range(s.phases)                       # [0] or [0,1,2]
+            indices    = range(s.effective_phases)             # [0], [0,1] or [0,1,2]
             for i in indices:
                 phase_powers[i]   += power_w
                 phase_currents[i] += current_ma

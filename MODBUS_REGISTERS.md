@@ -47,6 +47,7 @@ Der Server ist über alle Netzwerkinterfaces erreichbar, z.B.:
 | 7 | Error Code | UINT16 | - | 1 | R | 0-255 |
 | 8-9 | Set Current | UINT32 | mA | 1 | R/W | 0-32000 |
 | 10 | Phases | UINT16 | - | 1 | R/W | 1, 3 |
+| 11 | Vehicle Phases | UINT16 | - | 1 | R | 1-3 |
 
 ---
 

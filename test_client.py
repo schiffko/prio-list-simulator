@@ -40,7 +40,7 @@ class ChargingStationClient:
         
     def read_all_registers(self) -> dict:
         """Alle Register lesen"""
-        result = self.client.read_holding_registers(0, count=11, device_id=self.station_id)
+        result = self.client.read_holding_registers(0, count=12, device_id=self.station_id)
         
         return {
             'status': result.registers[0],
@@ -52,7 +52,8 @@ class ChargingStationClient:
             'max_power_kw': result.registers[6] * 0.1,
             'error_code': result.registers[7],
             'set_current_ma': result.registers[8] | (result.registers[9] << 16),
-            'phases': result.registers[10]
+            'phases': result.registers[10],
+            'vehicle_phases': result.registers[11]
         }
     
     def read_register(self, address: int, count: int = 1) -> list:
@@ -93,6 +94,7 @@ class ChargingStationClient:
         print(f"Error Code:    {status['error_code']}")
         print(f"Set Current:   {status['set_current_ma']} mA ({status['set_current_ma']/1000:.1f} A)")
         print(f"Phases:        {status['phases']}")
+        print(f"Vehicle Phases:{status['vehicle_phases']}")
         print("="*50 + "\n")
 
 
