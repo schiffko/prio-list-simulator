@@ -1,8 +1,11 @@
 """
-EV Charging Station + Smartfox Slave Energy Meter + Victron Battery Simulator
+EV Charging Station + Smartfox Slave Energy Meter + Victron Battery + Heater Simulator
 
 Charger simulation  (port 5020, unit-IDs = station IDs):
   Implements the register map expected by car_cc_debug.c
+
+Heater simulation  (port 5020, unit-IDs 210-212 = heater slot 0-2):
+  Implements the register map expected by ht_debug.c (VB_ID_DEBUG)
 
 Energy meter simulation  (port 502, unit-ID 1):
   Implements the register map read by em_smartfox_slave.c
@@ -178,6 +181,107 @@ class ChargingStationSimulator:
                 self.is_charging   = False
                 self.current_power = 0.0
                 self.status_code   = self.STATUS_CONNECTED
+
+
+# ---------------------------------------------------------------------------
+# Heater simulator (ht_debug.c, VB_ID_DEBUG)
+# ---------------------------------------------------------------------------
+
+HEATER_UNIT_ID_BASE = 210
+HEATER_COUNT        = 3
+
+
+class HeaterSimulator:
+    """Debug heater read/written by ht_debug.c.
+
+    Holding registers (0-based):
+      0    state            0 = ready, 1 = heating, 2 = max. temperature
+      1-2  measured power   W   uint32 high/low
+      3-4  energy total     Wh  uint32 high/low
+      5    boiler temp      0.1 degC
+      8-9  power setpoint   W   uint32 high/low  (written by the Smartfox)
+    """
+
+    STATE_READY    = 0
+    STATE_HEATING  = 1
+    STATE_MAX_TEMP = 2
+
+    STATE_NAMES = {0: "Ready", 1: "Heating", 2: "Max Temp"}
+
+    RAMP_W_PER_S      = 500
+    MAX_TEMP_HYST_C   = 5.0
+
+    def __init__(self, slot: int):
+        self.slot              = slot
+        self.unit_id           = HEATER_UNIT_ID_BASE + slot
+        self.nominal_power_w   = 3000
+        self.setpoint_w        = 0
+        self.power_w           = 0
+        self.energy_wh         = 0.0
+        self.temperature_c     = 45.0
+        self.max_temp_c        = 65.0
+        self.heat_rate_k_min   = 2.0     # temperature rise per minute at nominal power
+        self.cool_rate_k_min   = 0.2     # standing loss per minute
+        self.auto_temperature  = True
+        self.force_max_temp    = False
+        self.max_temp_reached  = False
+        self.last_request_time = "Never"
+        self.last_request_type = "None"
+
+    @property
+    def state(self) -> int:
+        if self.force_max_temp or self.max_temp_reached:
+            return self.STATE_MAX_TEMP
+        return self.STATE_HEATING if self.power_w > 0 else self.STATE_READY
+
+    def read_registers(self, start: int, count: int) -> list:
+        power  = int(self.power_w) & 0xFFFFFFFF
+        energy = int(self.energy_wh) & 0xFFFFFFFF
+        sp     = int(self.setpoint_w) & 0xFFFFFFFF
+        regs = {
+            0: self.state,
+            1: (power >> 16) & 0xFFFF,
+            2: power & 0xFFFF,
+            3: (energy >> 16) & 0xFFFF,
+            4: energy & 0xFFFF,
+            5: int(round(self.temperature_c * 10.0)) & 0xFFFF,
+            8: (sp >> 16) & 0xFFFF,
+            9: sp & 0xFFFF,
+        }
+        return [regs.get(start + i, 0) for i in range(count)]
+
+    def write_register(self, address: int, value: int) -> bool:
+        if address == 8:
+            self.setpoint_w = ((value & 0xFFFF) << 16) | (self.setpoint_w & 0xFFFF)
+            return True
+        if address == 9:
+            self.setpoint_w = (self.setpoint_w & 0xFFFF0000) | (value & 0xFFFF)
+            return True
+        return False
+
+    def update(self):
+        # Device-side thermostat: switches off at max_temp, back on below the hysteresis
+        if self.temperature_c >= self.max_temp_c:
+            self.max_temp_reached = True
+        elif self.temperature_c <= self.max_temp_c - self.MAX_TEMP_HYST_C:
+            self.max_temp_reached = False
+
+        target = min(self.setpoint_w, self.nominal_power_w)
+        if self.state == self.STATE_MAX_TEMP:
+            target = 0
+
+        diff = target - self.power_w
+        if abs(diff) <= self.RAMP_W_PER_S:
+            self.power_w = target
+        else:
+            self.power_w += self.RAMP_W_PER_S if diff > 0 else -self.RAMP_W_PER_S
+
+        self.energy_wh += self.power_w / 3600.0
+
+        if self.auto_temperature:
+            heat = (self.power_w / self.nominal_power_w) * self.heat_rate_k_min / 60.0 if self.nominal_power_w > 0 else 0.0
+            self.temperature_c += heat - self.cool_rate_k_min / 60.0
+            self.temperature_c = max(10.0, min(95.0, self.temperature_c))
 
 
 # ---------------------------------------------------------------------------
@@ -407,6 +511,12 @@ class CombinedModbusTCPServer:
 
     # ---- charger reads / writes ----
 
+    def _get_heater(self, unit_id):
+        for h in self.main_window.heaters:
+            if h.unit_id == unit_id:
+                return h
+        return None
+
     def _get_station(self, unit_id):
         for s in self.main_window.stations:
             if s.station_id == unit_id:
@@ -421,9 +531,15 @@ class CombinedModbusTCPServer:
             result = self.battery.read_registers(start, count)
             print(f"[Battery RX] Unit {unit_id}: Read HR {start} qty {count} -> {result}")
             return result
+        heater = self._get_heater(unit_id)
+        if heater is not None:
+            heater.last_request_time = now
+            heater.last_request_type = f"Read HR {start} (qty {count})"
+            result = heater.read_registers(start, count)
+            print(f"[Heater RX] Unit {unit_id}: Read HR {start} qty {count} -> {result}")
+            return result
         if unit_id == 100:
-            charger_total_w = sum(s.current_power * 1000 for s in self.main_window.stations)
-            result_w = self.main_window.surplus_power + charger_total_w
+            result_w = self.main_window.surplus_power + self.main_window.consumer_total_w()
             packed   = struct.pack('>f', result_w)
             high     = (packed[0] << 8) | packed[1]
             low      = (packed[2] << 8) | packed[3]
@@ -449,6 +565,14 @@ class CombinedModbusTCPServer:
             print(f"[Battery TX] Unit {unit_id}: Write HR {start} qty {len(values)} <- {values}")
             for i, value in enumerate(values):
                 self.battery.write_register(start + i, value)
+            return
+        heater = self._get_heater(unit_id)
+        if heater is not None:
+            heater.last_request_time = now
+            heater.last_request_type = f"Write HR {start} (qty {len(values)})"
+            print(f"[Heater TX] Unit {unit_id}: Write HR {start} qty {len(values)} <- {values}")
+            for i, value in enumerate(values):
+                heater.write_register(start + i, value)
             return
         if unit_id == 100:
             if start == 0 and len(values) >= 2:
@@ -831,6 +955,109 @@ class BatteryWidget(QGroupBox):
         )
 
 
+class HeaterWidget(QGroupBox):
+    def __init__(self, heater: HeaterSimulator, parent=None):
+        super().__init__(f"Debug Heater {heater.slot} (Unit-ID {heater.unit_id})", parent)
+        self.heater = heater
+        self._setup_ui()
+
+    def _setup_ui(self):
+        layout = QGridLayout()
+        row = 0
+
+        layout.addWidget(QLabel("Nominal Power:"), row, 0)
+        self.nominal_spin = QSpinBox()
+        self.nominal_spin.setRange(0, 30000)
+        self.nominal_spin.setSingleStep(100)
+        self.nominal_spin.setValue(self.heater.nominal_power_w)
+        self.nominal_spin.setSuffix(" W")
+        self.nominal_spin.valueChanged.connect(lambda v: setattr(self.heater, "nominal_power_w", v))
+        layout.addWidget(self.nominal_spin, row, 1)
+        row += 1
+
+        layout.addWidget(QLabel("Boiler Temp:"), row, 0)
+        self.temp_spin = QDoubleSpinBox()
+        self.temp_spin.setRange(0.0, 99.0)
+        self.temp_spin.setDecimals(1)
+        self.temp_spin.setValue(self.heater.temperature_c)
+        self.temp_spin.setSuffix(" C")
+        self.temp_spin.valueChanged.connect(lambda v: setattr(self.heater, "temperature_c", v))
+        layout.addWidget(self.temp_spin, row, 1)
+        row += 1
+
+        self.auto_temp_check = QCheckBox("Simulate temperature from power")
+        self.auto_temp_check.setChecked(self.heater.auto_temperature)
+        self.auto_temp_check.toggled.connect(lambda v: setattr(self.heater, "auto_temperature", v))
+        layout.addWidget(self.auto_temp_check, row, 0, 1, 2)
+        row += 1
+
+        layout.addWidget(QLabel("Max Temp:"), row, 0)
+        self.max_temp_spin = QDoubleSpinBox()
+        self.max_temp_spin.setRange(20.0, 99.0)
+        self.max_temp_spin.setDecimals(1)
+        self.max_temp_spin.setValue(self.heater.max_temp_c)
+        self.max_temp_spin.setSuffix(" C")
+        self.max_temp_spin.valueChanged.connect(lambda v: setattr(self.heater, "max_temp_c", v))
+        layout.addWidget(self.max_temp_spin, row, 1)
+        row += 1
+
+        self.force_max_check = QCheckBox("Force max. temperature (state 2)")
+        self.force_max_check.toggled.connect(lambda v: setattr(self.heater, "force_max_temp", v))
+        layout.addWidget(self.force_max_check, row, 0, 1, 2)
+        row += 1
+
+        layout.addWidget(QLabel("Setpoint:"), row, 0)
+        self.setpoint_label = QLabel("0 W")
+        self.setpoint_label.setStyleSheet("font-family: monospace;")
+        layout.addWidget(self.setpoint_label, row, 1)
+        row += 1
+
+        layout.addWidget(QLabel("Power:"), row, 0)
+        self.power_label = QLabel("0 W")
+        self.power_label.setStyleSheet("font-family: monospace; font-weight: bold;")
+        layout.addWidget(self.power_label, row, 1)
+        row += 1
+
+        layout.addWidget(QLabel("State:"), row, 0)
+        self.state_label = QLabel("-")
+        layout.addWidget(self.state_label, row, 1)
+        row += 1
+
+        layout.addWidget(QLabel("Energy:"), row, 0)
+        self.energy_label = QLabel("0 Wh")
+        self.energy_label.setStyleSheet("font-family: monospace;")
+        layout.addWidget(self.energy_label, row, 1)
+        row += 1
+
+        layout.addWidget(QLabel("Registers:"), row, 0)
+        self.reg_label = QLabel("-")
+        self.reg_label.setStyleSheet("font-family: monospace;")
+        layout.addWidget(self.reg_label, row, 1)
+        row += 1
+
+        layout.addWidget(QLabel("Last Request:"), row, 0)
+        self.last_req_label = QLabel("None")
+        self.last_req_label.setStyleSheet("font-size: 10px; color: gray;")
+        layout.addWidget(self.last_req_label, row, 1)
+
+        self.setLayout(layout)
+
+    def update_display(self):
+        if self.heater.auto_temperature:
+            self.temp_spin.blockSignals(True)
+            self.temp_spin.setValue(self.heater.temperature_c)
+            self.temp_spin.blockSignals(False)
+        self.setpoint_label.setText(f"{self.heater.setpoint_w} W")
+        self.power_label.setText(f"{int(self.heater.power_w)} W")
+        self.state_label.setText(HeaterSimulator.STATE_NAMES.get(self.heater.state, "?"))
+        self.energy_label.setText(f"{self.heater.energy_wh:.1f} Wh")
+        regs = self.heater.read_registers(0, 10)
+        self.reg_label.setText(" ".join(f"{i}={v}" for i, v in enumerate(regs) if i <= 5 or i >= 8))
+        self.last_req_label.setText(
+            f"[{self.heater.last_request_time}] {self.heater.last_request_type}"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Main window
 # ---------------------------------------------------------------------------
@@ -844,13 +1071,14 @@ class MainWindow(QMainWindow):
         self.surplus_power = 0.0
         self.meter         = SmartfoxSlaveSimulator()
         self.battery       = ModbusTcpBatterySimulator()
+        self.heaters       = [HeaterSimulator(slot) for slot in range(HEATER_COUNT)]
         self.setup_ui()
         self.start_servers()
         self.start_update_timer()
         self.add_stations()
 
     def setup_ui(self):
-        self.setWindowTitle("EV Charging Station + Smartfox Slave + Victron Battery Simulator")
+        self.setWindowTitle("EV Charging Station + Smartfox Slave + Victron Battery + Heater Simulator")
         self.setGeometry(100, 100, 1200, 900)
 
         central = QWidget()
@@ -866,7 +1094,7 @@ class MainWindow(QMainWindow):
         self.ip_combo.setFixedWidth(150)
         self.ip_combo.currentTextChanged.connect(self._on_ip_changed)
         info_layout.addWidget(self.ip_combo)
-        info_layout.addWidget(QLabel(":5020   (chargers: unit-ID = station ID  |  Victron battery: unit-ID 242  |  meter: addr ≥ 40000)"))
+        info_layout.addWidget(QLabel(":5020   (chargers: unit-ID = station ID  |  heaters: unit-ID 210-212  |  Victron battery: unit-ID 242  |  meter: addr ≥ 40000)"))
         copy_btn = QPushButton("Copy")
         copy_btn.setFixedWidth(50)
         copy_btn.clicked.connect(self._copy_ip)
@@ -942,6 +1170,17 @@ class MainWindow(QMainWindow):
         battery_layout.addWidget(self.battery_widget)
         battery_layout.addStretch()
         tabs.addTab(battery_tab, "Victron Battery (Unit-ID 242)")
+
+        # Heater tab
+        heater_tab = QWidget()
+        heater_layout = QHBoxLayout(heater_tab)
+        self.heater_widgets = []
+        for heater in self.heaters:
+            widget = HeaterWidget(heater)
+            self.heater_widgets.append(widget)
+            heater_layout.addWidget(widget, alignment=Qt.AlignmentFlag.AlignTop)
+        heater_layout.addStretch()
+        tabs.addTab(heater_tab, "Heaters (Unit-ID 210-212)")
 
         main_layout.addWidget(tabs)
 
@@ -1050,6 +1289,13 @@ class MainWindow(QMainWindow):
         if not battery_phase_indices:
             battery_phase_indices = [0]
 
+        # Heaters: spread evenly across all 3 phases
+        heater_total_w = sum(int(h.power_w) for h in self.heaters)
+        if heater_total_w:
+            for i in range(3):
+                phase_powers[i]   += int(heater_total_w / 3)
+                phase_currents[i] += int((heater_total_w / 3) / 230.0 * 1000.0)
+
         battery_power_per_phase = int(self.battery.power_w / len(battery_phase_indices))
         battery_current_ma = int((battery_power_per_phase / 230.0) * 1000.0)
         for i in battery_phase_indices:
@@ -1064,17 +1310,25 @@ class MainWindow(QMainWindow):
         self.surplus_spin.blockSignals(True)
         self.surplus_spin.setValue(self.surplus_power)
         self.surplus_spin.blockSignals(False)
-        charger_total_w = sum(s.current_power * 1000 for s in self.stations)
-        battery_total_w = self.battery.power_w
-        result_w        = int(self.surplus_power + charger_total_w + battery_total_w)
+        result_w        = int(self.surplus_power + self.consumer_total_w() + self.battery.power_w)
         self.surplus_result_label.setText(f"{result_w:+d} W")
         self.meter.total_power_w = result_w
         self._compute_phase_values()
+
+    def consumer_total_w(self) -> float:
+        """Power of all simulated consumers (chargers + heaters) in W."""
+        charger_total_w = sum(s.current_power * 1000 for s in self.stations)
+        heater_total_w  = sum(h.power_w for h in self.heaters)
+        return charger_total_w + heater_total_w
 
     def update_all(self):
         for station in self.stations:
             station.update()
         self.battery.update()
+        for heater in self.heaters:
+            heater.update()
+        for widget in self.heater_widgets:
+            widget.update_display()
         for widget in self.findChildren(StationWidget):
             widget.update_display()
 

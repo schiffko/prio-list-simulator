@@ -23,6 +23,7 @@ Jede Ladestation wird über dieselbe IP/Port-Adresse erreicht, differenzert übe
 | Station N | 5020 | N |
 | **Global (Überschuss)** | **5020** | **100** |
 | **Victron Battery** | **5020** | **242** |
+| **Debug-Heizstab 0-2** | **5020** | **210-212** |
 
 ### Netzwerk
 
@@ -77,6 +78,31 @@ def to_i16(v):
 power_w = to_i16(power_regs[0]) * to_i16(power_regs[1]) / 1000
 temp_c = to_i16(temp_reg) / 10.0
 ```
+
+---
+
+## Heizstab-Register (Unit-ID 210-212)
+
+Simuliert bis zu drei Heizstäbe für das Smartfox-Produkt `VB_ID_DEBUG` (Treiber `ht_debug.c`, im Web-UI admin-only als Verbrauchsregler "DEBUG").
+
+| Parameter | Wert |
+|-----------|------|
+| Host | IP aus der Titelleiste (alle Debug-Heizstäbe müssen dieselbe IP haben) |
+| Port | 5020 |
+| Unit ID | 210 + Heizstab-Platz (210, 211, 212) |
+
+| Register | Beschreibung | Einheit | Zugriff |
+|----------|-------------|---------|---------|
+| 0 | Zustand: 0 = bereit, 1 = heizt, 2 = Max. Temperatur | – | R |
+| 1-2 | Gemessene Leistung (High/Low Word) | W | R |
+| 3-4 | Energie gesamt (High/Low Word) | Wh | R |
+| 5 | Kesseltemperatur | 0,1 °C | R |
+| 8-9 | Sollleistung (High/Low Word) | W | R/W (FC16 vom Smartfox) |
+
+Verhalten:
+- Die Leistung folgt der Sollleistung mit 500 W/s, begrenzt auf die Nennleistung.
+- Optional wird die Kesseltemperatur aus der Leistung simuliert. Ab "Max Temp" meldet der Heizstab Zustand 2 und schaltet ab, unter "Max Temp − 5 °C" wieder ein. "Force max. temperature" erzwingt Zustand 2.
+- Die Heizstab-Leistung geht gleichmäßig auf alle 3 Phasen in den simulierten Energiezähler und in Unit-ID 100 ein.
 
 ---
 
