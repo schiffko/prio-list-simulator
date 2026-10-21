@@ -107,6 +107,24 @@ Verhalten:
 - Optional wird die Kesseltemperatur aus der Leistung simuliert. Ab "Max Temp" meldet der Heizstab Zustand 2 und schaltet ab, unter "Max Temp − 5 °C" wieder ein. "Force max. temperature" erzwingt Zustand 2.
 - Die Heizstab-Leistung geht gleichmäßig auf alle 3 Phasen in den simulierten Energiezähler und in Unit-ID 100 ein.
 
+## Steuer-API (für Skripte / Claude)
+
+Der Simulator lässt sich lokal über HTTP bedienen: `http://127.0.0.1:8020` (nur localhost). Jeder Aufruf macht dasselbe wie der entsprechende Klick und gibt den gesamten Zustand zurück.
+
+| Aufruf | Body (alle Felder optional, außer markiert) |
+|--------|---------------------------------------------|
+| `GET /state` | – |
+| `POST /surplus` | `{"w": -3000}` (Pflicht; − = Einspeisung) |
+| `POST /stations` | `{"count": 3}` hinzufügen, `{"clear": true}` leeren |
+| `POST /station/<id>` | `{"action": "plug_in"\|"plug_out"\|"error", "vehicle_phases": 1-3, "max_power_kw": 11, "manual_amperage": 10 oder null}` |
+| `POST /heater/<slot>` | `{"nominal_power_w", "temperature_c", "max_temp_c", "auto_temperature", "force_max_temp"}` |
+| `POST /battery` | `{"power_w", "soc", "temperature_c"}` |
+| `POST /community` | `{"enabled": true, "others_w": -16000, "key": 0.5}` |
+| `POST /smartfox` | `{"ip": "192.168.100.170"}` |
+| `POST /configure` | `{"device": "all"\|"meter"\|"battery"\|"station"\|"heater", "id": n, "remove": false}` |
+
+Beispiel: `curl -X POST localhost:8020/station/1 -d '{"action":"plug_in"}'`
+
 ## Smartfox automatisch einstellen
 
 Oben im Fenster die **Smartfox-IP** eintragen; als Simulator-IP gilt die Auswahl in der Zeile "Modbus TCP". Jedes Gerät hat **Konfigurieren** / **Entfernen**, "Alle konfigurieren" stellt Zähler, Stationen, Heizstäbe und Batterie nacheinander ein. Der Simulator schreibt dazu über die JSON-API des Smartfox (`POST /api/devices/config/<typ>/<slot>`, nur die geänderten Felder; andere Einstellungen des Slots bleiben):

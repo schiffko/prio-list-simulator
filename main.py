@@ -26,6 +26,8 @@ import threading
 import urllib.request
 import urllib.error
 import json
+import queue
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -1347,6 +1349,192 @@ class CommunityWidget(QGroupBox):
 
 
 # ---------------------------------------------------------------------------
+# Control API (http://127.0.0.1:8020) - drive the simulator from scripts / Claude
+# ---------------------------------------------------------------------------
+
+CONTROL_API_PORT = 8020
+
+
+class ControlApi:
+    """
+    Local HTTP JSON API that does what the buttons do. Every request runs in the GUI thread
+    (MainWindow.run_in_gui), so the window shows the same state as after a click.
+
+      GET  /state                              everything below, plus measured values
+      POST /surplus        {"w": -3000}        PV surplus input (Unit-ID 100 / meter), - = feed-in
+      POST /stations       {"count": 3} | {"clear": true}
+      POST /station/<id>   {"action": "plug_in"|"plug_out"|"error", "vehicle_phases": 1-3,
+                            "max_power_kw": 11, "manual_amperage": 10 | null}
+      POST /heater/<slot>  {"nominal_power_w", "temperature_c", "max_temp_c", "auto_temperature", "force_max_temp"}
+      POST /battery        {"power_w", "soc", "temperature_c"}
+      POST /community      {"enabled": true, "others_w": -16000, "key": 0.5}
+      POST /smartfox       {"ip": "192.168.100.170"}
+      POST /configure      {"device": "all"|"meter"|"battery"|"station"|"heater", "id": n, "remove": false}
+    """
+
+    def __init__(self, window, port=CONTROL_API_PORT):
+        self.window = window
+        api = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def _reply(self, code, obj):
+                body = json.dumps(obj, indent=1).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def _handle(self, method):
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                    body = json.loads(self.rfile.read(length) or b"{}") if length else {}
+                    parts = [x for x in self.path.split("?")[0].split("/") if x]
+                    result = api.window.run_in_gui(lambda: api.dispatch(method, parts, body))
+                    self._reply(200, result)
+                except (KeyError, ValueError, IndexError) as e:
+                    self._reply(400, {"error": f"{type(e).__name__}: {e}"})
+                except Exception as e:
+                    self._reply(500, {"error": f"{type(e).__name__}: {e}"})
+
+            def do_GET(self):  self._handle("GET")
+            def do_POST(self): self._handle("POST")
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        print(f"[Control API] listening on http://127.0.0.1:{port}")
+
+    # ---- runs in the GUI thread ----
+
+    def dispatch(self, method, parts, body):
+        w = self.window
+        if method == "GET" and parts == ["state"]:
+            return self.state()
+        if method != "POST" or not parts:
+            raise KeyError(f"unknown endpoint {method} /{'/'.join(parts)}")
+
+        if parts == ["surplus"]:
+            w._on_surplus_changed(float(body["w"]))
+        elif parts == ["stations"]:
+            if body.get("clear"):
+                w.clear_stations()
+            if "count" in body:
+                w.station_count_spin.setValue(int(body["count"]))
+                w.add_stations()
+        elif parts[0] == "station":
+            widget = self._station_widget(int(parts[1]))
+            st = widget.station
+            action = body.get("action")
+            if action == "plug_in":    widget.on_plug_in()
+            elif action == "plug_out": widget.on_plug_out()
+            elif action == "error":    widget.on_error()
+            elif action is not None:   raise ValueError(f"unknown action {action}")
+            if "vehicle_phases" in body:
+                st.vehicle_phases = int(body["vehicle_phases"])
+            if "max_power_kw" in body:
+                widget.max_power_spin.setValue(float(body["max_power_kw"]))
+            if "manual_amperage" in body:
+                if body["manual_amperage"] is None:
+                    widget.manual_checkbox.setChecked(False)
+                else:
+                    widget.amperage_spin.setValue(float(body["manual_amperage"]))
+            widget.update_display()
+        elif parts[0] == "heater":
+            widget = w.heater_widgets[int(parts[1])]
+            for key, spin in (("nominal_power_w", widget.nominal_spin), ("temperature_c", widget.temp_spin),
+                              ("max_temp_c", widget.max_temp_spin)):
+                if key in body:
+                    spin.setValue(body[key])
+            if "auto_temperature" in body:
+                widget.auto_temp_check.setChecked(bool(body["auto_temperature"]))
+            if "force_max_temp" in body:
+                widget.force_max_check.setChecked(bool(body["force_max_temp"]))
+        elif parts == ["battery"]:
+            b = w.battery
+            if "power_w" in body:       b.power_w = int(body["power_w"])
+            if "soc" in body:           b.soc_percent = int(body["soc"])
+            if "temperature_c" in body: b.temperature_c = float(body["temperature_c"])
+        elif parts == ["community"]:
+            c = w.community_widget
+            if "others_w" in body: c.others_spin.setValue(float(body["others_w"]))
+            if "key" in body:      c.key_spin.setValue(float(body["key"]))
+            if "enabled" in body:  c.enable_cb.setChecked(bool(body["enabled"]))
+        elif parts == ["smartfox"]:
+            w.smartfox_ip_edit.setText(str(body["ip"]))
+        elif parts == ["configure"]:
+            self._configure(body)
+        else:
+            raise KeyError(f"unknown endpoint POST /{'/'.join(parts)}")
+        return self.state()
+
+    def _station_widget(self, station_id):
+        for widget in self.window.findChildren(StationWidget):
+            if widget.station.station_id == station_id:
+                return widget
+        raise KeyError(f"no station {station_id}")
+
+    def _configure(self, body):
+        w = self.window
+        device = body.get("device", "all")
+        if device == "all":
+            w.configure_all()
+            return
+        bars = {
+            "meter":   lambda: w.meter_widget.config_bar,
+            "battery": lambda: w.battery_widget.config_bar,
+            "station": lambda: self._station_widget(int(body["id"])).config_bar,
+            "heater":  lambda: w.heater_widgets[int(body["id"])].config_bar,
+        }
+        bar = bars[device]()
+        bar.remove() if body.get("remove") else bar.configure()
+
+    def state(self):
+        w = self.window
+        c = w.community_widget
+        stations = []
+        for st in w.stations:
+            widget = self._station_widget(st.station_id)
+            stations.append({
+                "id": st.station_id, "status": st.status, "set_current_ma": st.set_current_ma,
+                "amperage": st.current_amperage, "power_kw": round(st.current_power, 3),
+                "phases": st.phases, "vehicle_phases": st.vehicle_phases, "max_power_kw": st.max_power,
+                "manual_amperage": st.manual_amperage, "energy_kwh": round(st.energy_delivered, 3),
+                "last_request": f"[{st.last_request_time}] {st.last_request_type}",
+                "config_status": widget.config_bar.status,
+            })
+        heaters = [{
+            "slot": h.slot, "unit_id": h.unit_id, "nominal_power_w": h.nominal_power_w,
+            "setpoint_w": h.setpoint_w, "power_w": int(h.power_w), "state": HeaterSimulator.STATE_NAMES.get(h.state),
+            "temperature_c": round(h.temperature_c, 1), "max_temp_c": h.max_temp_c,
+            "auto_temperature": h.auto_temperature, "force_max_temp": h.force_max_temp,
+            "last_request": f"[{h.last_request_time}] {h.last_request_type}",
+            "config_status": hw.config_bar.status,
+        } for h, hw in zip(w.heaters, w.heater_widgets)]
+        b = w.battery
+        delayed_own, community_power, my_surplus = c._values()
+        return {
+            "sim_ip": w.ip_combo.currentText(), "smartfox_ip": w.smartfox_ip_edit.text(),
+            "surplus_w": w.surplus_power, "grid_w": w.grid_power_w(), "meter_total_w": w.meter.total_power_w,
+            "stations": stations, "heaters": heaters,
+            "battery": {"power_w": b.power_w, "target_power_w": b.target_power_w, "soc": b.soc_percent,
+                        "temperature_c": b.temperature_c,
+                        "setpoints_w": [b.setpoint_l1_w, b.setpoint_l2_w, b.setpoint_l3_w],
+                        "config_status": w.battery_widget.config_bar.status},
+            "meter": {"total_power_w": w.meter.total_power_w, "phase_powers_w": w.meter.phase_powers_w,
+                      "smartfox_slot": w.meter_widget.slot_spin.value(),
+                      "config_status": w.meter_widget.config_bar.status},
+            "community": {"enabled": c.enable_cb.isChecked(), "others_w": c.others_spin.value(),
+                          "key": c.key_spin.value(), "own_delayed_w": delayed_own,
+                          "community_power": community_power, "my_surplus": my_surplus,
+                          "expected_share_w": -c.key_spin.value() * c.others_spin.value(),
+                          "last_result": c.last_result},
+        }
+
+
+# ---------------------------------------------------------------------------
 # Main window
 # ---------------------------------------------------------------------------
 
@@ -1362,6 +1550,7 @@ class MainWindow(QMainWindow):
         self.heaters       = [HeaterSimulator(slot) for slot in range(HEATER_COUNT)]
         # Widgets are read when a button is clicked, so the lambdas may refer to them before setup_ui()
         self.api           = SmartfoxApi(lambda: self.smartfox_ip_edit.text(), lambda: self.ip_combo.currentText())
+        self.gui_calls     = queue.Queue()   # (fn, result queue) from the control API threads
         self.setup_ui()
         self.start_servers()
         self.start_update_timer()
@@ -1577,6 +1766,30 @@ class MainWindow(QMainWindow):
     def start_servers(self):
         self.server_thread = CombinedServerThread(self)
         self.server_thread.start()
+        self.gui_call_timer = QTimer(self)
+        self.gui_call_timer.timeout.connect(self._run_gui_calls)
+        self.gui_call_timer.start(50)
+        try:
+            self.control_api = ControlApi(self)
+        except OSError as e:
+            print(f"[Control API] port {CONTROL_API_PORT} not available: {e}")
+
+    def run_in_gui(self, fn, timeout=5.0):
+        """Runs fn in the GUI thread and returns its result (called from other threads)."""
+        result = queue.Queue(maxsize=1)
+        self.gui_calls.put((fn, result))
+        ok, value = result.get(timeout=timeout)
+        if not ok:
+            raise value
+        return value
+
+    def _run_gui_calls(self):
+        while not self.gui_calls.empty():
+            fn, result = self.gui_calls.get()
+            try:
+                result.put((True, fn()))
+            except Exception as e:
+                result.put((False, e))
 
     def start_update_timer(self):
         self.timer = QTimer()
