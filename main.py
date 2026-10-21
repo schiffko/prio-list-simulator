@@ -7,7 +7,7 @@ Charger simulation  (port 5020, unit-IDs = station IDs):
 Heater simulation  (port 5020, unit-IDs 210-212 = heater slot 0-2):
   Implements the register map expected by ht_debug.c (VB_ID_DEBUG)
 
-Energy meter simulation  (port 502, unit-ID 1):
+Energy meter simulation  (port 502 or 5020, unit-ID 1):
   Implements the register map read by em_smartfox_slave.c
 
   Register map (PDU 0-indexed = Modbus address - 1):
@@ -23,11 +23,14 @@ import socket
 import struct
 import asyncio
 import threading
+import urllib.request
+import urllib.error
+import json
 from datetime import datetime
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QSpinBox, QGroupBox, QScrollArea,
-    QGridLayout, QDoubleSpinBox, QComboBox, QCheckBox, QTabWidget
+    QGridLayout, QDoubleSpinBox, QComboBox, QCheckBox, QTabWidget, QLineEdit
 )
 from PyQt6.QtCore import QTimer, Qt
 
@@ -421,6 +424,7 @@ class ModbusTcpBatterySimulator:
 #   start <  40000  ->  charger      (car_cc_debug.c register map)
 # ---------------------------------------------------------------------------
 
+MODBUS_PORTS = (5020, 502)
 METER_REG_THRESHOLD = 40000
 BATTERY_UNIT_ID = 242
 BATTERY_SYSTEM_UNIT_ID = 0
@@ -591,10 +595,21 @@ class CombinedModbusTCPServer:
             station.write_register(start + i, value)
 
     async def serve(self):
-        self._server = await asyncio.start_server(self._handle_client, '0.0.0.0', 5020)
-        print("[Modbus] Combined server listening on 0.0.0.0:5020")
-        async with self._server:
-            await self._server.serve_forever()
+        # 5020: debug drivers (car_cc_debug.c, ht_debug.c, wp_debug.c)
+        # 502:  drivers with a hard-coded port (em_smartfox_slave.c, bs_victron.c),
+        #       so no port forwarding is needed. macOS and Windows allow binding
+        #       0.0.0.0:502 without root; on Linux this needs root or
+        #       CAP_NET_BIND_SERVICE, otherwise only 5020 is served.
+        servers = []
+        for port in MODBUS_PORTS:
+            try:
+                servers.append(await asyncio.start_server(self._handle_client, '0.0.0.0', port))
+                print(f"[Modbus] Combined server listening on 0.0.0.0:{port}")
+            except OSError as e:
+                print(f"[Modbus] Port {port} not available: {e}")
+        if not servers:
+            raise RuntimeError("no Modbus TCP port available")
+        await asyncio.gather(*(s.serve_forever() for s in servers))
 
 
 class CombinedServerThread(threading.Thread):
@@ -619,12 +634,135 @@ class CombinedServerThread(threading.Thread):
 # UI widgets
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Smartfox configuration over its JSON API (http://<smartfox>/api/, no auth)
+# ---------------------------------------------------------------------------
+
+# Firmware product ids (schnittstelle.id) and device type numbers of devices/config/<type>/<idx>
+SF_TYPE_VB, SF_TYPE_CC, SF_TYPE_EM, SF_TYPE_BS = 1, 2, 3, 5
+SF_CC_SLOTS = 5
+SF_PRODUCT_CC_DEBUG       = 24   # car_cc_debug.c: port 5020, unit id = schnittstelle.address
+SF_PRODUCT_VB_DEBUG       = 10   # ht_debug.c: port 5020, unit id 210 + slot (fixed)
+SF_PRODUCT_BS_VICTRON_VE  = 9    # bs_victron.c: port 502, unit id 242 (fixed)
+SF_PRODUCT_EM_SLAVE_TCP   = 8    # em_smartfox_slave.c: port 502, unit id 1 (fixed)
+
+
+class SmartfoxApi:
+    """Configures the Smartfox under test. Every POST is saved to its flash - only on a click."""
+
+    def __init__(self, smartfox_ip, sim_ip):
+        self.smartfox_ip = smartfox_ip   # callables, read in the GUI thread
+        self.sim_ip      = sim_ip
+
+    def request(self, base_url, method, path, body=None, timeout=5):
+        data = None if body is None else json.dumps(body).encode()
+        req = urllib.request.Request(f"{base_url}{path}", data=data, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.status, json.loads(resp.read() or b"null")
+        except urllib.error.HTTPError as e:
+            try:
+                return e.code, json.loads(e.read() or b"null")
+            except ValueError:
+                return e.code, None
+
+
+class SmartfoxConfigBar(QWidget):
+    """
+    "Konfigurieren" / "Entfernen" for one simulated device. build() runs in the GUI thread and returns
+    (path, device, checks): device is the partial {"device": ...} content, checks a list of
+    (path, predicate(json) -> warning or None) run before the POST. The HTTP calls run in a thread;
+    the result is shown by a timer (Qt widgets must not be touched from the thread).
+    """
+
+    def __init__(self, api: SmartfoxApi, build, parent=None):
+        super().__init__(parent)
+        self.api    = api
+        self.build  = build
+        self.status = "-"
+        self.busy   = False
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 4, 0, 0)
+        self.config_btn = QPushButton("Konfigurieren")
+        self.config_btn.clicked.connect(self.configure)
+        layout.addWidget(self.config_btn)
+        self.remove_btn = QPushButton("Entfernen")
+        self.remove_btn.clicked.connect(self.remove)
+        layout.addWidget(self.remove_btn)
+        self.status_label = QLabel("-")
+        self.status_label.setStyleSheet("font-size: 10px; color: #444;")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label, 1)
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(lambda: self.status_label.setText(self.status))
+        self.timer.start(300)
+
+    def _start(self, remove):
+        if self.busy:
+            return
+        built = self.build()
+        if isinstance(built, str):   # not configurable (e.g. no free slot)
+            self.status = built
+            return
+        path, device, checks = built
+        if remove:
+            device, checks = {"schnittstelle": {"id": 0}}, []
+        base_url = f"http://{self.api.smartfox_ip().strip()}/api/"
+        self.busy = True
+        self.status = "sende ..."
+        threading.Thread(target=self._run, args=(base_url, path, device, checks, remove), daemon=True).start()
+
+    def configure(self): self._start(remove=False)
+    def remove(self):    self._start(remove=True)
+
+    def _run(self, base_url, path, device, checks, remove):
+        now = datetime.now().strftime("%H:%M:%S")
+        try:
+            warnings = []
+            for check_path, check in checks:
+                code, data = self.api.request(base_url, "GET", check_path)
+                warning = check(data) if code == 200 else f"{check_path}: HTTP {code}"
+                if warning:
+                    warnings.append(warning)
+
+            code, data = self.api.request(base_url, "POST", path, {"device": device})
+            if code != 200:
+                err = data.get("error") if isinstance(data, dict) else data
+                self.status = f"[{now}] {path}: HTTP {code} {err or ''}"
+                return
+            sch = (data or {}).get("device", {}).get("schnittstelle", {})
+            if remove:
+                result = f"entfernt (Produkt {sch.get('id')})"
+            else:
+                result = f"OK: Produkt {sch.get('id')}, IP {sch.get('ip')}, Adresse {sch.get('address')}"
+            self.status = f"[{now}] {path} {result}" + "".join(f"  ⚠ {w}" for w in warnings)
+        except Exception as e:
+            self.status = f"[{now}] Fehler: {e}"
+        finally:
+            self.busy = False
+            print(f"[Smartfox API] {self.status}")
+
+
 class StationWidget(QGroupBox):
-    def __init__(self, station: ChargingStationSimulator, parent=None):
+    def __init__(self, station: ChargingStationSimulator, api: SmartfoxApi, parent=None):
         super().__init__(f"Station {station.station_id}", parent)
         self.station = station
+        self.api     = api
         self.window  = None
         self.setup_ui()
+
+    def smartfox_config(self):
+        """Smartfox charger slot station_id - 1, unit id = station id (Modbus address)."""
+        sid = self.station.station_id
+        if sid > SF_CC_SLOTS:
+            return f"Smartfox hat nur {SF_CC_SLOTS} Ladestations-Slots"
+        device = {
+            "name": f"SIM Station {sid}",
+            "schnittstelle": {"id": SF_PRODUCT_CC_DEBUG, "ip": self.api.sim_ip(), "address": sid},
+        }
+        return f"devices/config/{SF_TYPE_CC}/{sid - 1}", device, []
 
     def setup_ui(self):
         layout = QGridLayout()
@@ -708,6 +846,9 @@ class StationWidget(QGroupBox):
         self.last_req_label.setStyleSheet("font-size: 10px; color: gray;")
         layout.addWidget(self.last_req_label,    13, 1)
 
+        self.config_bar = SmartfoxConfigBar(self.api, self.smartfox_config)
+        layout.addWidget(self.config_bar,        14, 0, 1, 2)
+
         self.setLayout(layout)
 
     def update_display(self):
@@ -770,10 +911,20 @@ class StationWidget(QGroupBox):
 
 
 class MeterWidget(QGroupBox):
-    def __init__(self, meter: SmartfoxSlaveSimulator, parent=None):
-        super().__init__("Smartfox Slave Meter  (port 5020, Unit-ID 1)", parent)
+    def __init__(self, meter: SmartfoxSlaveSimulator, api: SmartfoxApi, parent=None):
+        super().__init__("Smartfox Slave Meter  (port 502, Unit-ID 1)", parent)
         self.meter = meter
+        self.api   = api
         self._setup_ui()
+
+    def smartfox_config(self):
+        """Smartfox meter slot (chosen), added to the grid power: the simulated grid."""
+        device = {
+            "name": "SIM Netz",
+            "schnittstelle": {"id": SF_PRODUCT_EM_SLAVE_TCP, "ip": self.api.sim_ip()},
+            "produkt": {"effect_on_gridpower": 1},
+        }
+        return f"devices/config/{SF_TYPE_EM}/{self.slot_spin.value()}", device, []
 
     def _setup_ui(self):
         layout = QGridLayout()
@@ -836,6 +987,17 @@ class MeterWidget(QGroupBox):
         self.last_req_label = QLabel("None")
         self.last_req_label.setStyleSheet("font-size: 10px; color: gray;")
         layout.addWidget(self.last_req_label, row, 1, 1, 2)
+        row += 1
+
+        layout.addWidget(QLabel("Smartfox-Zähler-Slot:"), row, 0)
+        self.slot_spin = QSpinBox()
+        self.slot_spin.setRange(0, 4)
+        self.slot_spin.setToolTip("Zähler-Slot am Smartfox (0-basiert); wird als Netz-Zähler (addieren) eingestellt")
+        layout.addWidget(self.slot_spin, row, 1)
+        row += 1
+
+        self.config_bar = SmartfoxConfigBar(self.api, self.smartfox_config)
+        layout.addWidget(self.config_bar, row, 0, 1, 3)
 
         self.setLayout(layout)
 
@@ -863,10 +1025,19 @@ class MeterWidget(QGroupBox):
 
 
 class BatteryWidget(QGroupBox):
-    def __init__(self, battery: ModbusTcpBatterySimulator, parent=None):
-        super().__init__(f"Victron Battery (port 5020, Unit-ID {battery.unit_id})", parent)
+    def __init__(self, battery: ModbusTcpBatterySimulator, api: SmartfoxApi, parent=None):
+        super().__init__(f"Victron Battery (port 502, Unit-ID {battery.unit_id})", parent)
         self.battery = battery
+        self.api     = api
         self._setup_ui()
+
+    def smartfox_config(self):
+        """Smartfox battery slot 0."""
+        device = {
+            "name": "SIM Victron",
+            "schnittstelle": {"id": SF_PRODUCT_BS_VICTRON_VE, "ip": self.api.sim_ip()},
+        }
+        return f"devices/config/{SF_TYPE_BS}/0", device, []
 
     def _setup_ui(self):
         layout = QGridLayout()
@@ -916,6 +1087,9 @@ class BatteryWidget(QGroupBox):
         self.last_req_label.setStyleSheet("font-size: 10px; color: gray;")
         layout.addWidget(self.last_req_label, 6, 1)
 
+        self.config_bar = SmartfoxConfigBar(self.api, self.smartfox_config)
+        layout.addWidget(self.config_bar, 7, 0, 1, 2)
+
         self.setLayout(layout)
 
     def _on_power_changed(self, value: int):
@@ -956,10 +1130,30 @@ class BatteryWidget(QGroupBox):
 
 
 class HeaterWidget(QGroupBox):
-    def __init__(self, heater: HeaterSimulator, parent=None):
+    def __init__(self, heater: HeaterSimulator, api: SmartfoxApi, parent=None):
         super().__init__(f"Debug Heater {heater.slot} (Unit-ID {heater.unit_id})", parent)
         self.heater = heater
+        self.api    = api
         self._setup_ui()
+
+    def smartfox_config(self):
+        """Smartfox consumer slot = heater slot (unit id 210 + slot is fixed in ht_debug.c)."""
+        slot = self.heater.slot
+        device = {
+            "name": f"SIM Heizstab {slot}",
+            "schnittstelle": {"id": SF_PRODUCT_VB_DEBUG, "ip": self.api.sim_ip()},
+            "produkt": {"power": self.heater.nominal_power_w},
+        }
+        checks = []
+        if slot > 0:
+            # ConsReg_Set.c starts the driver of slot 1/2 on a change only if slot 0 is a debug heater too
+            def slot0_is_debug(data):
+                product = (data or {}).get("device", {}).get("schnittstelle", {}).get("id")
+                if product != SF_PRODUCT_VB_DEBUG:
+                    return "Slot 0 ist kein Debug-Heizstab - Treiber läuft erst nach Neustart des Smartfox"
+                return None
+            checks.append((f"devices/config/{SF_TYPE_VB}/0", slot0_is_debug))
+        return f"devices/config/{SF_TYPE_VB}/{slot}", device, checks
 
     def _setup_ui(self):
         layout = QGridLayout()
@@ -1039,6 +1233,10 @@ class HeaterWidget(QGroupBox):
         self.last_req_label = QLabel("None")
         self.last_req_label.setStyleSheet("font-size: 10px; color: gray;")
         layout.addWidget(self.last_req_label, row, 1)
+        row += 1
+
+        self.config_bar = SmartfoxConfigBar(self.api, self.smartfox_config)
+        layout.addWidget(self.config_bar, row, 0, 1, 2)
 
         self.setLayout(layout)
 
@@ -1058,6 +1256,96 @@ class HeaterWidget(QGroupBox):
         )
 
 
+class CommunityWidget(QGroupBox):
+    """
+    Energy community (EVG) server stand-in for a debug-build Smartfox.
+
+    Every 10 s it POSTs  http://<device>/api/debug/community/<community_power>/<community_my_surplus>
+    like my.smartfox.at answers it: community_power = sum of the members' grid power including ours
+    (grid convention, - = feed-in, ours as uploaded about 10 s ago), my_surplus = key * community_power.
+    While values keep coming in, the device skips the server fetch.
+    """
+    SEND_INTERVAL_S = 10
+    OWN_DELAY_S     = 10   # our grid power reaches the server via the live view upload
+
+    def __init__(self, own_grid_w, api: SmartfoxApi, parent=None):
+        super().__init__("Energiegemeinschaft (Debug-Build: api/debug/community)", parent)
+        self.own_grid_w = own_grid_w          # callable: our grid power now (W, + = import)
+        self.api        = api
+        self.own_hist   = []
+        self.tick       = 0
+        self.last_result = "-"
+        self._setup_ui()
+
+    def _setup_ui(self):
+        layout = QGridLayout()
+        self.enable_cb = QCheckBox("Senden aktiv (an die Smartfox-IP oben)")
+        layout.addWidget(self.enable_cb, 0, 0, 1, 3)
+
+        layout.addWidget(QLabel("Netz übrige Mitglieder:"), 1, 0)
+        self.others_spin = QDoubleSpinBox()
+        self.others_spin.setRange(-100000.0, 100000.0)
+        self.others_spin.setDecimals(0)
+        self.others_spin.setSingleStep(500)
+        self.others_spin.setSuffix(" W")
+        self.others_spin.setValue(-6000.0)
+        self.others_spin.setFixedWidth(120)
+        layout.addWidget(self.others_spin, 1, 1)
+        layout.addWidget(QLabel("(− = Einspeisung)"), 1, 2)
+
+        layout.addWidget(QLabel("Schlüssel:"), 2, 0)
+        self.key_spin = QDoubleSpinBox()
+        self.key_spin.setRange(0.0, 1.0)
+        self.key_spin.setDecimals(3)
+        self.key_spin.setSingleStep(0.05)
+        self.key_spin.setValue(0.5)
+        self.key_spin.setFixedWidth(120)
+        layout.addWidget(self.key_spin, 2, 1)
+
+        self.values_label = QLabel("-")
+        self.values_label.setStyleSheet("font-family: monospace;")
+        layout.addWidget(self.values_label, 3, 0, 1, 3)
+        self.status_label = QLabel("-")
+        self.status_label.setStyleSheet("font-family: monospace; color: #444;")
+        layout.addWidget(self.status_label, 4, 0, 1, 3)
+        self.setLayout(layout)
+
+    def _values(self):
+        delayed_own = self.own_hist[0] if self.own_hist else self.own_grid_w()
+        community_power = int(delayed_own + self.others_spin.value())
+        my_surplus = int(self.key_spin.value() * community_power)
+        return delayed_own, community_power, my_surplus
+
+    def tick_1s(self):
+        """Called every second by the main window."""
+        self.own_hist.append(self.own_grid_w())
+        if len(self.own_hist) > self.OWN_DELAY_S:
+            self.own_hist.pop(0)
+
+        delayed_own, community_power, my_surplus = self._values()
+        expected_s = -self.key_spin.value() * self.others_spin.value()
+        self.values_label.setText(
+            f"eigenes Netz (vor {self.OWN_DELAY_S} s): {delayed_own:+.0f} W   community_power: {community_power:+d} W   "
+            f"my_surplus: {my_surplus:+d} W   →  S erwartet: {expected_s:+.0f} W"
+        )
+        self.status_label.setText(self.last_result)
+
+        self.tick += 1
+        if self.enable_cb.isChecked() and self.tick % self.SEND_INTERVAL_S == 0:
+            url = f"http://{self.api.smartfox_ip().strip()}/api/debug/community/{community_power}/{my_surplus}"
+            threading.Thread(target=self._send, args=(url,), daemon=True).start()
+
+    def _send(self, url):
+        now = datetime.now().strftime("%H:%M:%S")
+        try:
+            req = urllib.request.Request(url, data=b"", method="POST")
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                self.last_result = f"[{now}] POST {url.rsplit('/api/', 1)[-1]} -> {resp.status}"
+        except Exception as e:
+            self.last_result = f"[{now}] POST fehlgeschlagen: {e}"
+        print(f"[Community] {self.last_result}")
+
+
 # ---------------------------------------------------------------------------
 # Main window
 # ---------------------------------------------------------------------------
@@ -1072,6 +1360,8 @@ class MainWindow(QMainWindow):
         self.meter         = SmartfoxSlaveSimulator()
         self.battery       = ModbusTcpBatterySimulator()
         self.heaters       = [HeaterSimulator(slot) for slot in range(HEATER_COUNT)]
+        # Widgets are read when a button is clicked, so the lambdas may refer to them before setup_ui()
+        self.api           = SmartfoxApi(lambda: self.smartfox_ip_edit.text(), lambda: self.ip_combo.currentText())
         self.setup_ui()
         self.start_servers()
         self.start_update_timer()
@@ -1094,13 +1384,26 @@ class MainWindow(QMainWindow):
         self.ip_combo.setFixedWidth(150)
         self.ip_combo.currentTextChanged.connect(self._on_ip_changed)
         info_layout.addWidget(self.ip_combo)
-        info_layout.addWidget(QLabel(":5020   (chargers: unit-ID = station ID  |  heaters: unit-ID 210-212  |  Victron battery: unit-ID 242  |  meter: addr ≥ 40000)"))
+        info_layout.addWidget(QLabel(":5020 / :502   (chargers: unit-ID = station ID  |  heaters: unit-ID 210-212  |  Victron battery: unit-ID 242  |  meter: addr ≥ 40000)"))
         copy_btn = QPushButton("Copy")
         copy_btn.setFixedWidth(50)
         copy_btn.clicked.connect(self._copy_ip)
         info_layout.addWidget(copy_btn)
         info_layout.addStretch()
         main_layout.addLayout(info_layout)
+
+        # ---- Smartfox under test (configured over its JSON API) ----
+        sf_layout = QHBoxLayout()
+        sf_layout.addWidget(QLabel("Smartfox-IP:"))
+        self.smartfox_ip_edit = QLineEdit("192.168.100.170")
+        self.smartfox_ip_edit.setFixedWidth(150)
+        sf_layout.addWidget(self.smartfox_ip_edit)
+        sf_layout.addWidget(QLabel("(\"Konfigurieren\" stellt das Gerät dort mit der Simulator-IP oben ein)"))
+        config_all_btn = QPushButton("Alle konfigurieren")
+        config_all_btn.clicked.connect(self.configure_all)
+        sf_layout.addWidget(config_all_btn)
+        sf_layout.addStretch()
+        main_layout.addLayout(sf_layout)
 
         # ---- Tabs ----
         tabs = QTabWidget()
@@ -1158,7 +1461,7 @@ class MainWindow(QMainWindow):
         # Meter tab
         meter_tab = QWidget()
         meter_layout = QVBoxLayout(meter_tab)
-        self.meter_widget = MeterWidget(self.meter)
+        self.meter_widget = MeterWidget(self.meter, self.api)
         meter_layout.addWidget(self.meter_widget)
         meter_layout.addStretch()
         tabs.addTab(meter_tab, "Energy Meter (addr ≥ 40000)")
@@ -1166,7 +1469,7 @@ class MainWindow(QMainWindow):
         # Battery tab
         battery_tab = QWidget()
         battery_layout = QVBoxLayout(battery_tab)
-        self.battery_widget = BatteryWidget(self.battery)
+        self.battery_widget = BatteryWidget(self.battery, self.api)
         battery_layout.addWidget(self.battery_widget)
         battery_layout.addStretch()
         tabs.addTab(battery_tab, "Victron Battery (Unit-ID 242)")
@@ -1176,11 +1479,19 @@ class MainWindow(QMainWindow):
         heater_layout = QHBoxLayout(heater_tab)
         self.heater_widgets = []
         for heater in self.heaters:
-            widget = HeaterWidget(heater)
+            widget = HeaterWidget(heater, self.api)
             self.heater_widgets.append(widget)
             heater_layout.addWidget(widget, alignment=Qt.AlignmentFlag.AlignTop)
         heater_layout.addStretch()
         tabs.addTab(heater_tab, "Heaters (Unit-ID 210-212)")
+
+        # Energy community tab
+        community_tab = QWidget()
+        community_layout = QVBoxLayout(community_tab)
+        self.community_widget = CommunityWidget(self.grid_power_w, self.api)
+        community_layout.addWidget(self.community_widget)
+        community_layout.addStretch()
+        tabs.addTab(community_tab, "Energiegemeinschaft")
 
         main_layout.addWidget(tabs)
 
@@ -1225,9 +1536,35 @@ class MainWindow(QMainWindow):
             self.stations.append(station)
             row    = len(self.stations) // 4
             col    = (len(self.stations) - 1) % 4
-            widget = StationWidget(station)
+            widget = StationWidget(station, self.api)
             widget.window = self
             self.stations_layout.addWidget(widget, row, col)
+
+    def configure_all(self):
+        """Grid meter, all stations (up to the Smartfox slots), heaters and battery. Heater 0 first:
+        slots 1/2 only start on a change when slot 0 is a debug heater already."""
+        bars = [self.meter_widget.config_bar]
+        bars += [w.config_bar for w in self.findChildren(StationWidget) if w.station.station_id <= SF_CC_SLOTS]
+        bars += [w.config_bar for w in self.heater_widgets]
+        bars.append(self.battery_widget.config_bar)
+        # One after another (parallel POSTs would collide in the small httpd); the bars read Qt widgets,
+        # so they are started from a GUI-thread timer, not from a worker thread.
+        self._config_queue = bars
+        self._config_current = None
+        if not hasattr(self, "_config_timer"):
+            self._config_timer = QTimer(self)
+            self._config_timer.timeout.connect(self._configure_next)
+        self._config_timer.start(200)
+
+    def _configure_next(self):
+        if self._config_current is not None and self._config_current.busy:
+            return
+        if not self._config_queue:
+            self._config_timer.stop()
+            self._config_current = None
+            return
+        self._config_current = self._config_queue.pop(0)
+        self._config_current.configure()
 
     def clear_stations(self):
         self.stations.clear()
@@ -1315,6 +1652,10 @@ class MainWindow(QMainWindow):
         self.meter.total_power_w = result_w
         self._compute_phase_values()
 
+    def grid_power_w(self) -> float:
+        """Our grid power as Unit-ID 100 reports it (W, + = import, - = feed-in)."""
+        return self.surplus_power + self.consumer_total_w()
+
     def consumer_total_w(self) -> float:
         """Power of all simulated consumers (chargers + heaters) in W."""
         charger_total_w = sum(s.current_power * 1000 for s in self.stations)
@@ -1336,6 +1677,7 @@ class MainWindow(QMainWindow):
         self.update_surplus_display()  # set new total + phase values for this cycle
         self.meter_widget.update_display()
         self.battery_widget.update_display()
+        self.community_widget.tick_1s()
 
 
 def main():

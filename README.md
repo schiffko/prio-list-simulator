@@ -35,7 +35,9 @@ pip install -r requirements.txt
 python main.py
 ```
 
-Die Applikation öffnet sich und startet automatisch einen Modbus-TCP-Server auf Port **5020**.
+Die Applikation öffnet sich und startet automatisch einen Modbus-TCP-Server auf Port **5020** und **502** (gleicher Server, beide Ports liefern dieselben Daten).
+Port 502 ist für Treiber mit fest eingestelltem Port (`em_smartfox_slave.c`, `bs_victron.c`) – eine Portweiterleitung 502 → 5020 ist damit nicht mehr nötig.
+Unter macOS und Windows klappt das ohne Admin-Rechte; unter Linux braucht Port 502 root bzw. `CAP_NET_BIND_SERVICE`, sonst läuft nur 5020 (Hinweis in der Konsole).
 Die aktive Host-IP wird oben rechts im Fenster angezeigt (Button "Copy IP" kopiert sie in die Zwischenablage).
 
 ## Modbus-Verbindung
@@ -73,7 +75,7 @@ Abgebildeter Registersatz aus `bs_victron.c`:
 Empfohlene Smartfox-Konfiguration für den Test:
 
 - Produkt: `BS_ID_VICTRON_VE_CTRL`
-- Port testweise auf `5020`
+- Port: Treiber nutzt fest `502`, der Simulator lauscht dort direkt
 - `threePhases = 0` für den einfachsten Start
 
 Schreibverhalten:
@@ -104,6 +106,46 @@ Verhalten:
 - Die Leistung folgt der Sollleistung mit 500 W/s, begrenzt auf die Nennleistung.
 - Optional wird die Kesseltemperatur aus der Leistung simuliert. Ab "Max Temp" meldet der Heizstab Zustand 2 und schaltet ab, unter "Max Temp − 5 °C" wieder ein. "Force max. temperature" erzwingt Zustand 2.
 - Die Heizstab-Leistung geht gleichmäßig auf alle 3 Phasen in den simulierten Energiezähler und in Unit-ID 100 ein.
+
+## Smartfox automatisch einstellen
+
+Oben im Fenster die **Smartfox-IP** eintragen; als Simulator-IP gilt die Auswahl in der Zeile "Modbus TCP". Jedes Gerät hat **Konfigurieren** / **Entfernen**, "Alle konfigurieren" stellt Zähler, Stationen, Heizstäbe und Batterie nacheinander ein. Der Simulator schreibt dazu über die JSON-API des Smartfox (`POST /api/devices/config/<typ>/<slot>`, nur die geänderten Felder; andere Einstellungen des Slots bleiben):
+
+| Simulator | Smartfox-Slot | Produkt (`schnittstelle.id`) | Unit-ID / Port |
+|-----------|---------------|------------------------------|----------------|
+| Station N | Ladestation N−1 (max. 5) | 24 `CC_ID_CC_DEBUG` | `address` = N, Port 5020 |
+| Heizstab k | Verbrauchsregler k | 10 `VB_ID_DEBUG`, Leistung = Nennleistung | 210 + k, Port 5020 (fest) |
+| Victron-Batterie | Batterie 0 | 9 `BS_ID_VICTRON_VE_CTRL` | 242, Port 502 (fest) |
+| Slave-Zähler | Zähler (Slot wählbar) | 8 Smartfox Slave TCP, "auf Netz addieren" | 1, Port 502 (fest) |
+
+"Entfernen" setzt das Produkt des Slots auf 0. Betriebsart (Automatik/Manuell) und Priorität werden nicht verändert.
+
+Hinweise:
+- Jeder Klick speichert die Einstellungen im Flash des Smartfox.
+- Heizstab 1/2: Die Firmware startet den Treiber bei einer Änderung nur, wenn Slot 0 auch ein Debug-Heizstab ist (sonst erst nach Neustart) - der Simulator warnt dann.
+- Ladestationen brauchen eine CC-Lizenz (Testlizenz reicht).
+
+## Energiegemeinschaft (EVG)
+
+Ersetzt den Server `my.smartfox.at` für die Gemeinschaftswerte. Funktioniert nur mit einer **Debug-Build-Firmware** (der Endpunkt fehlt im Release-Build).
+
+Tab "Energiegemeinschaft": "Senden aktiv" anhaken (geht an die Smartfox-IP oben im Fenster). Alle 10 s geht ein
+
+```
+POST http://<Geräte-IP>/api/debug/community/<community_power>/<community_my_surplus>
+```
+
+an das Gerät, berechnet wie vom Server:
+
+| Wert | Berechnung |
+|------|------------|
+| `community_power` | eigene Netzleistung (Unit-ID 100, von vor 10 s – so verzögert kommt sie über den Liveview-Upload beim Server an) + "Netz übrige Mitglieder" (− = Einspeisung) |
+| `community_my_surplus` | Schlüssel × `community_power` |
+
+Das Gerät rechnet die eigene Leistung wieder heraus; der erwartete Anteil S = −Schlüssel × "Netz übrige Mitglieder" wird im Tab angezeigt (die Firmware filtert S mit τ = 60 s).
+Solange Werte kommen, ruft das Gerät den Server nicht ab; 30 s nach dem letzten POST übernimmt wieder der Server.
+
+Ohne Simulator geht es auch per `curl -X POST http://<Geräte-IP>/api/debug/community/-6000/-3000`.
 
 ## Modbus-Register (Holding Registers, 0-basiert)
 
