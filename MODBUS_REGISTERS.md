@@ -22,7 +22,7 @@ Jede Ladestation wird über dieselbe IP/Port-Adresse erreicht, differenzert übe
 | Station 3 | 5020 | 3 |
 | Station N | 5020 | N |
 | **Global (Überschuss)** | **5020** | **100** |
-| **Victron Battery** | **5020** | **242** |
+| **Victron Battery** | **502 / 5020** | **0 (System), 242 / 246 / 227** |
 | **Debug-Heizstab 0-2** | **5020** | **210-212** |
 
 ### Netzwerk
@@ -52,13 +52,18 @@ Der Server ist über alle Netzwerkinterfaces erreichbar, z.B.:
 
 ---
 
-## Victron-Batterie-Register (Unit-ID 242)
+## Victron-Batterie-Register (Unit-ID 0, 242, 246, 227)
 
-Geeignet für `BS_ID_VICTRON_VE_CTRL` bei testweise auf `5020` gesetztem Port.
+Geeignet für `BS_ID_VICTRON_VE_CTRL` (Port 502 oder 5020). Mehrere Batterien werden über die lokale IP unterschieden, zu der der Client verbunden ist (Feld "Local IP" der Batterie; leer = jede IP).
+
+| Unit ID | Register |
+|---------|----------|
+| 0 (System) | 843 SoC, 842 Cerbo-Leistung (W) |
+| 242 / 246 / 227 (VE / CC / Cerbo) | 26 Spannung (×100 V), 27 Strom (×10 A), 61 Temperatur, 37/40/41 Setpoints |
 
 | Adresse | Name | Typ | Einheit | Skala | Zugriff | Wertebereich |
 |---------|------|-----|---------|-------|---------|--------------|
-| 26-27 | Battery Power | INT16 × INT16 | W | `reg26 * reg27 / 1000` | R | ca. ±32767 |
+| 26-27 | Battery Power | INT16 × INT16 | W | `reg26 * reg27 / 1000` (Spannung × 100 V, Strom × 10 A) | R | ca. ±32767 |
 | 37 | Setpoint L1 | INT16 | W | 1 | W | ca. ±32767 |
 | 40 | Setpoint L2 | INT16 | W | 1 | W | ca. ±32767 |
 | 41 | Setpoint L3 | INT16 | W | 1 | W | ca. ±32767 |

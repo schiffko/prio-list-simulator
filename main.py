@@ -7,6 +7,12 @@ Charger simulation  (port 5020, unit-IDs = station IDs):
 Heater simulation  (port 5020, unit-IDs 210-212 = heater slot 0-2):
   Implements the register map expected by ht_debug.c (VB_ID_DEBUG)
 
+Battery simulation  (port 502 or 5020, unit-IDs 0 / 242 / 246 / 227):
+  Victron VE / CC / Cerbo register map of bs_victron.c, several batteries via local IP
+
+Device polling: reads the JSON API of the real Smartfox (/api/liveview/*) as surplus source
+Control API: http://127.0.0.1:8020 (see API.md, mcp_server.py)
+
 Energy meter simulation  (port 502 or 5020, unit-ID 1):
   Implements the register map read by em_smartfox_slave.c
 
@@ -27,6 +33,8 @@ import urllib.request
 import urllib.error
 import json
 import queue
+import random
+import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime
 from PyQt6.QtWidgets import (
@@ -347,76 +355,191 @@ class SmartfoxSlaveSimulator:
             self.energy_reverse_wh += abs(self.total_power_w) / 3600.0
 
 
-class ModbusTcpBatterySimulator:
-    """Simple Victron VE battery model for bs_victron.c"""
+# ---------------------------------------------------------------------------
+# Battery simulator — register map of bs_victron.c (Victron VE / CC / Cerbo CTRL)
+# ---------------------------------------------------------------------------
 
-    REG_SOC = 843
-    REG_POWER = 26
-    REG_TEMP = 61
-    REG_SETPOINT_L1 = 37
-    REG_SETPOINT_L2 = 40
-    REG_SETPOINT_L3 = 41
+VICTRON_SYSTEM_UNIT   = 0                 # SoC reg 843, Cerbo power reg 842
+VICTRON_DEVICE_UNITS  = (242, 246, 227)   # VE, CC, Cerbo: power 26/27, temp 61, setpoints 37/40/41
+VICTRON_REG_SOC       = 843
+VICTRON_REG_CERBO_P   = 842
+VICTRON_REG_VOLTAGE   = 26
+VICTRON_REG_CURRENT   = 27
+VICTRON_REG_TEMP      = 61
+VICTRON_REG_SETPOINTS = (37, 40, 41)      # L1, L2, L3
 
-    def __init__(self, unit_id: int = 242):
-        self.unit_id = unit_id
-        self.power_w = 0
-        self.soc_percent = 50
-        self.temperature_c = 23.5
-        self.setpoint_l1_w = 0
-        self.setpoint_l2_w = 0
-        self.setpoint_l3_w = 0
-        self.target_power_w = 0
-        self.power_source_scale = 1000
+
+def _s16(value: int) -> int:
+    value &= 0xFFFF
+    return value - 0x10000 if value & 0x8000 else value
+
+
+class BatterySimulator:
+    """Battery with delayed, ramped response to the setpoint written by bs_victron.c (W, + = charge)."""
+
+    VOLTAGE_V = 50.0
+
+    def __init__(self, battery_id: int):
+        self.battery_id        = battery_id
+        self.local_ip          = ""        # empty = answers on any local IP
+        self.capacity_kwh      = 10.0
+        self.soc               = 50.0
+        self.max_charge_w      = 5000
+        self.max_discharge_w   = 5000
+        self.ramp_w_per_s      = 2000
+        self.delay_s           = 2
+        self.phases            = 1         # must match the firmware's three-phase battery setting
+        self.temperature_c     = 25.0
+        self.setpoint_regs     = [0, 0, 0]
+        self.actual_power_w    = 0.0
+        self._pending          = []        # setpoints still inside the response delay
         self.last_request_time = "Never"
         self.last_request_type = "None"
 
-    @staticmethod
-    def _to_u16(value: int) -> int:
-        return value & 0xFFFF
+    @property
+    def setpoint_w(self) -> int:
+        # bs_victron.c writes the same value to every phase register, so 3-phase delivers the sum
+        if self.phases == 3:
+            return sum(self.setpoint_regs)
+        return self.setpoint_regs[0]
 
-    def read_registers(self, start: int, count: int) -> list:
-        regs = {}
-        regs[self.REG_SOC] = self._to_u16(int(self.soc_percent))
-        regs[self.REG_POWER] = self._to_u16(self.power_source_scale)
-        regs[self.REG_POWER + 1] = self._to_u16(int(self.power_w))
-        regs[self.REG_TEMP] = self._to_u16(int(round(self.temperature_c * 10.0)))
-        regs[self.REG_SETPOINT_L1] = self._to_u16(self.setpoint_l1_w)
-        regs[self.REG_SETPOINT_L2] = self._to_u16(self.setpoint_l2_w)
-        regs[self.REG_SETPOINT_L3] = self._to_u16(self.setpoint_l3_w)
-        return [regs.get(start + i, 0) for i in range(count)]
+    def read_registers(self, unit_id: int, start: int, count: int) -> list:
+        if unit_id == VICTRON_SYSTEM_UNIT:
+            regs = {
+                VICTRON_REG_SOC:     int(self.soc),
+                VICTRON_REG_CERBO_P: int(self.actual_power_w),
+            }
+        else:
+            regs = {
+                VICTRON_REG_VOLTAGE: int(self.VOLTAGE_V * 100),
+                VICTRON_REG_CURRENT: int(round(self.actual_power_w / self.VOLTAGE_V * 10)),
+                VICTRON_REG_TEMP:    int(self.temperature_c * 10),
+            }
+            for reg, val in zip(VICTRON_REG_SETPOINTS, self.setpoint_regs):
+                regs[reg] = val
+        return [regs.get(start + i, 0) & 0xFFFF for i in range(count)]
 
-    def write_register(self, address: int, value: int) -> bool:
-        signed = value if value < 0x8000 else value - 0x10000
-
-        if address == self.REG_SOC:
-            self.soc_percent = max(0, min(100, signed))
-            return True
-        if address == self.REG_TEMP:
-            self.temperature_c = signed / 10.0
-            return True
-        if address == self.REG_SETPOINT_L1:
-            self.setpoint_l1_w = signed
-            self.target_power_w = signed
-            return True
-        if address == self.REG_SETPOINT_L2:
-            self.setpoint_l2_w = signed
-            self.target_power_w = signed
-            return True
-        if address == self.REG_SETPOINT_L3:
-            self.setpoint_l3_w = signed
-            self.target_power_w = signed
-            return True
-        return False
+    def write_registers(self, start: int, values: list):
+        for i, value in enumerate(values):
+            reg = start + i
+            if reg in VICTRON_REG_SETPOINTS:
+                self.setpoint_regs[VICTRON_REG_SETPOINTS.index(reg)] = _s16(value)
 
     def update(self):
-        diff = self.target_power_w - self.power_w
-        if diff == 0:
-            return
-        step = 250 if diff > 0 else -250
-        if abs(diff) <= abs(step):
-            self.power_w = self.target_power_w
-        else:
-            self.power_w += step
+        self._pending.append(self.setpoint_w)
+        while len(self._pending) > self.delay_s + 1:   # delay was lowered in the UI
+            self._pending.pop(0)
+        target =self._pending.pop(0) if len(self._pending) > self.delay_s else self.actual_power_w
+
+        target = max(-self.max_discharge_w, min(self.max_charge_w, target))
+        if (self.soc >= 100.0 and target > 0) or (self.soc <= 0.0 and target < 0):
+            target = 0
+
+        diff = target - self.actual_power_w
+        step = min(abs(diff), self.ramp_w_per_s)
+        self.actual_power_w += step if diff > 0 else -step
+
+        if self.capacity_kwh > 0:
+            self.soc += self.actual_power_w / 3600.0 / (self.capacity_kwh * 1000.0) * 100.0
+            self.soc = max(0.0, min(100.0, self.soc))
+
+
+# ---------------------------------------------------------------------------
+# Device poller — reads the JSON API (/api/liveview/data + /devices) of the real SmartFox
+# ---------------------------------------------------------------------------
+
+
+# Device-type keys of /api/liveview/devices (enum PRODUKT_TYPE in JsonBuilderConstants.h)
+API_TYPE_HEATER  = "1"   # Verbrauchsregler, power in kW
+API_TYPE_CHARGER = "2"   # Ladestation, power in W
+API_TYPE_BATTERY = "5"   # Batterie, power in W (+ = charging)
+API_TYPE_AOUT    = "9"   # Analogausgang, power in kW
+
+
+class DevicePoller(threading.Thread):
+    """Field names stay the old values.xml ids so the rest of the simulator is unchanged."""
+
+    NUMERIC_FIELDS = {
+        'detailsPowerValue',                              # total grid power W (pos = consuming)
+        'toGridValue',                                    # grid power kW     (pos = feeding/surplus)
+        'powerL1Value', 'powerL2Value', 'powerL3Value',  # phase powers W
+        'ampereL1Value', 'ampereL2Value', 'ampereL3Value',# phase currents A
+        'cc1Power', 'cc2Power', 'cc3Power', 'cc4Power', 'cc5Power',  # charger powers kW
+        'consumptionControl1Power', 'consumptionControl2Power', 'consumptionControl3Power',
+        'analogOutPower',
+        'batt1Power', 'batt2Power', 'batt3Power',         # battery powers W (+ = charging)
+    }
+    STRING_FIELDS = {
+        'hidCcSt1', 'hidCcSt2', 'hidCcSt3', 'hidCcSt4', 'hidCcSt5',
+    }
+    FIELDS = NUMERIC_FIELDS | STRING_FIELDS
+
+    def __init__(self, ip: str, interval: int):
+        super().__init__(daemon=True)
+        self.ip       = ip
+        self.interval = interval
+        self._stop_evt = threading.Event()
+        self._lock    = threading.Lock()
+        self._values: dict = {}
+        self.last_poll_time = "Never"
+        self.last_error: str | None = None
+
+    def stop(self):
+        self._stop_evt.set()
+
+    def run(self):
+        while not self._stop_evt.is_set():
+            self._poll()
+            self._stop_evt.wait(timeout=self.interval)
+
+    def _get_json(self, path: str) -> dict:
+        with urllib.request.urlopen(f"http://{self.ip}{path}", timeout=5) as resp:
+            return json.loads(resp.read().decode("utf-8", errors="replace"))
+
+    def _poll(self):
+        try:
+            data    = self._get_json("/api/liveview/data")
+            devices = self._get_json("/api/liveview/devices").get("devices", {})
+            values  = self._parse(data, devices)
+            with self._lock:
+                self._values = values
+                self.last_poll_time = datetime.now().strftime("%H:%M:%S")
+                self.last_error = None
+        except Exception as e:
+            with self._lock:
+                self.last_error = str(e)
+
+    @staticmethod
+    def _parse(data: dict, devices: dict) -> dict:
+        values: dict = {}
+        meas = data.get("meas", {})
+
+        grid_w = meas.get("power", {}).get("W")
+        if grid_w is not None:
+            values["detailsPowerValue"] = float(grid_w)
+            values["toGridValue"]       = -float(grid_w) / 1000.0
+        for i in range(1, 4):
+            phase = meas.get(f"l{i}", {})
+            if "power" in phase:
+                values[f"powerL{i}Value"] = float(phase["power"])
+            if "current" in phase:
+                values[f"ampereL{i}Value"] = float(phase["current"]) / 1000.0   # mA -> A
+
+        for i, cc in enumerate(devices.get(API_TYPE_CHARGER, [])[:5], start=1):
+            values[f"cc{i}Power"] = float(cc.get("power") or 0) / 1000.0
+            values[f"hidCcSt{i}"] = str(cc.get("state", ""))
+        for i, vb in enumerate(devices.get(API_TYPE_HEATER, [])[:3], start=1):
+            values[f"consumptionControl{i}Power"] = float(vb.get("power") or 0)
+        aout = devices.get(API_TYPE_AOUT, [])
+        if aout:
+            values["analogOutPower"] = float(aout[0].get("power") or 0)
+        for i, bs in enumerate(devices.get(API_TYPE_BATTERY, [])[:3], start=1):
+            values[f"batt{i}Power"] = float(bs.get("power") or 0)
+        return values
+
+    def get(self) -> tuple[dict, str, str | None]:
+        with self._lock:
+            return dict(self._values), self.last_poll_time, self.last_error
 
 
 # ---------------------------------------------------------------------------
@@ -428,8 +551,6 @@ class ModbusTcpBatterySimulator:
 
 MODBUS_PORTS = (5020, 502)
 METER_REG_THRESHOLD = 40000
-BATTERY_UNIT_ID = 242
-BATTERY_SYSTEM_UNIT_ID = 0
 
 
 class CombinedModbusTCPServer:
@@ -445,13 +566,10 @@ class CombinedModbusTCPServer:
     def meter(self) -> SmartfoxSlaveSimulator:
         return self.main_window.meter
 
-    @property
-    def battery(self) -> ModbusTcpBatterySimulator:
-        return self.main_window.battery
-
     async def _handle_client(self, reader, writer):
-        peer = writer.get_extra_info('peername')
-        print(f"[Modbus] Connected: {peer}")
+        peer     = writer.get_extra_info('peername')
+        local_ip = writer.get_extra_info('sockname')[0]
+        print(f"[Modbus] Connected: {peer} -> {local_ip}")
         try:
             while True:
                 header   = await reader.readexactly(7)
@@ -460,7 +578,7 @@ class CombinedModbusTCPServer:
                 unit_id  = header[6]
                 pdu          = await reader.readexactly(length - 1)
                 func_code    = pdu[0]
-                response_pdu = self._dispatch(unit_id, func_code, pdu[1:])
+                response_pdu = self._dispatch(unit_id, func_code, pdu[1:], local_ip)
                 resp_len = len(response_pdu) + 1
                 writer.write(
                     struct.pack('>HHH', trans_id, 0, resp_len)
@@ -475,9 +593,12 @@ class CombinedModbusTCPServer:
             writer.close()
             print(f"[Modbus] Disconnected: {peer}")
 
-    def _dispatch(self, unit_id, func_code, data):
+    def _dispatch(self, unit_id, func_code, data, local_ip=""):
         try:
             start = struct.unpack_from('>H', data, 0)[0]
+
+            if unit_id == VICTRON_SYSTEM_UNIT or unit_id in VICTRON_DEVICE_UNITS:
+                return self._dispatch_battery(unit_id, func_code, start, data, local_ip)
 
             if func_code == self.FC_READ_HOLDING:
                 count  = struct.unpack_from('>H', data, 2)[0]
@@ -505,6 +626,47 @@ class CombinedModbusTCPServer:
             print(f"[Modbus] Dispatch error unit {unit_id} fc {func_code}: {e}")
             return bytes([func_code | 0x80, 0x04])
 
+    # ---- battery (bs_victron.c) ----
+
+    def _get_battery(self, local_ip):
+        batteries = self.main_window.batteries
+        for b in batteries:
+            if b.local_ip and b.local_ip == local_ip:
+                return b
+        for b in batteries:
+            if not b.local_ip:
+                return b
+        return None
+
+    def _dispatch_battery(self, unit_id, func_code, start, data, local_ip):
+        battery = self._get_battery(local_ip)
+        if battery is None:
+            return bytes([func_code | 0x80, 0x0B])   # gateway target failed to respond
+        now = datetime.now().strftime("%H:%M:%S")
+
+        if func_code == self.FC_READ_HOLDING:
+            count   = struct.unpack_from('>H', data, 2)[0]
+            values  = battery.read_registers(unit_id, start, count)
+            battery.last_request_time = now
+            battery.last_request_type = f"Unit {unit_id} read {start} qty {count}"
+            print(f"[Batt {battery.battery_id} RX] Unit {unit_id}: Read HR {start} qty {count} -> {values}")
+            payload = b''.join(struct.pack('>H', v) for v in values)
+            return bytes([func_code, len(payload)]) + payload
+
+        if func_code == self.FC_WRITE_SINGLE:
+            values = [struct.unpack_from('>H', data, 2)[0]]
+        elif func_code == self.FC_WRITE_MULTIPLE:
+            count  = struct.unpack_from('>H', data, 2)[0]
+            values = [struct.unpack_from('>H', data, 5 + i * 2)[0] for i in range(count)]
+        else:
+            return bytes([func_code | 0x80, 0x01])
+
+        battery.write_registers(start, values)
+        battery.last_request_time = now
+        battery.last_request_type = f"Unit {unit_id} write {start} <- {[_s16(v) for v in values]}"
+        print(f"[Batt {battery.battery_id} TX] Unit {unit_id}: Write HR {start} <- {[_s16(v) for v in values]}")
+        return bytes([func_code]) + data[:4]
+
     # ---- meter reads ----
 
     def _read_meter(self, start, count):
@@ -531,12 +693,6 @@ class CombinedModbusTCPServer:
 
     def _read_charger(self, unit_id, start, count):
         now = datetime.now().strftime("%H:%M:%S")
-        if unit_id in (BATTERY_UNIT_ID, BATTERY_SYSTEM_UNIT_ID):
-            self.battery.last_request_time = now
-            self.battery.last_request_type = f"Read HR {start} (qty {count}, unit {unit_id})"
-            result = self.battery.read_registers(start, count)
-            print(f"[Battery RX] Unit {unit_id}: Read HR {start} qty {count} -> {result}")
-            return result
         heater = self._get_heater(unit_id)
         if heater is not None:
             heater.last_request_time = now
@@ -565,13 +721,6 @@ class CombinedModbusTCPServer:
 
     def _write_charger(self, unit_id, start, values):
         now = datetime.now().strftime("%H:%M:%S")
-        if unit_id == BATTERY_UNIT_ID:
-            self.battery.last_request_time = now
-            self.battery.last_request_type = f"Write HR {start} (qty {len(values)})"
-            print(f"[Battery TX] Unit {unit_id}: Write HR {start} qty {len(values)} <- {values}")
-            for i, value in enumerate(values):
-                self.battery.write_register(start + i, value)
-            return
         heater = self._get_heater(unit_id)
         if heater is not None:
             heater.last_request_time = now
@@ -643,6 +792,7 @@ class CombinedServerThread(threading.Thread):
 # Firmware product ids (schnittstelle.id) and device type numbers of devices/config/<type>/<idx>
 SF_TYPE_VB, SF_TYPE_CC, SF_TYPE_EM, SF_TYPE_BS = 1, 2, 3, 5
 SF_CC_SLOTS = 5
+SF_BS_SLOTS = 3
 SF_PRODUCT_CC_DEBUG       = 24   # car_cc_debug.c: port 5020, unit id = schnittstelle.address
 SF_PRODUCT_VB_DEBUG       = 10   # ht_debug.c: port 5020, unit id 210 + slot (fixed)
 SF_PRODUCT_BS_VICTRON_VE  = 9    # bs_victron.c: port 502, unit id 242 (fixed)
@@ -1027,108 +1177,102 @@ class MeterWidget(QGroupBox):
 
 
 class BatteryWidget(QGroupBox):
-    def __init__(self, battery: ModbusTcpBatterySimulator, api: SmartfoxApi, parent=None):
-        super().__init__(f"Victron Battery (port 502, Unit-ID {battery.unit_id})", parent)
+    def __init__(self, battery: BatterySimulator, api: SmartfoxApi, parent=None):
+        super().__init__(f"Battery {battery.battery_id}  (Victron VE CTRL, unit 0 + 242)", parent)
         self.battery = battery
         self.api     = api
         self._setup_ui()
 
     def smartfox_config(self):
-        """Smartfox battery slot 0."""
+        """Smartfox battery slot battery_id - 1. Answers on its own local IP if one is set."""
+        slot = self.battery.battery_id - 1
+        if slot >= SF_BS_SLOTS:
+            return f"Smartfox hat nur {SF_BS_SLOTS} Batterie-Slots"
         device = {
-            "name": "SIM Victron",
-            "schnittstelle": {"id": SF_PRODUCT_BS_VICTRON_VE, "ip": self.api.sim_ip()},
+            "name": f"SIM Victron {self.battery.battery_id}",
+            "schnittstelle": {"id": SF_PRODUCT_BS_VICTRON_VE, "ip": self.battery.local_ip or self.api.sim_ip()},
         }
-        return f"devices/config/{SF_TYPE_BS}/0", device, []
+        return f"devices/config/{SF_TYPE_BS}/{slot}", device, []
+
+    def _spin(self, lo, hi, value, suffix, slot, decimals=None):
+        spin = QDoubleSpinBox() if decimals is not None else QSpinBox()
+        if decimals is not None:
+            spin.setDecimals(decimals)
+        spin.setRange(lo, hi)
+        spin.setValue(value)
+        spin.setSuffix(suffix)
+        spin.valueChanged.connect(slot)
+        return spin
 
     def _setup_ui(self):
-        layout = QGridLayout()
+        b  = self.battery
+        gl = QGridLayout()
+        row = 0
 
-        layout.addWidget(QLabel("Measured Power:"), 0, 0)
-        self.power_spin = QSpinBox()
-        self.power_spin.setRange(-50000, 50000)
-        self.power_spin.setValue(self.battery.power_w)
-        self.power_spin.setSuffix(" W")
-        self.power_spin.valueChanged.connect(self._on_power_changed)
-        layout.addWidget(self.power_spin, 0, 1)
+        gl.addWidget(QLabel("Local IP (empty = any):"), row, 0)
+        self.ip_edit = QLineEdit(b.local_ip)
+        self.ip_edit.setPlaceholderText("any")
+        self.ip_edit.textChanged.connect(lambda t: setattr(b, 'local_ip', t.strip()))
+        gl.addWidget(self.ip_edit, row, 1); row += 1
 
-        layout.addWidget(QLabel("SoC:"), 1, 0)
-        self.soc_spin = QSpinBox()
-        self.soc_spin.setRange(0, 100)
-        self.soc_spin.setValue(self.battery.soc_percent)
-        self.soc_spin.setSuffix(" %")
-        self.soc_spin.valueChanged.connect(self._on_soc_changed)
-        layout.addWidget(self.soc_spin, 1, 1)
+        gl.addWidget(QLabel("Phases (= firmware setting):"), row, 0)
+        self.phases_combo = QComboBox()
+        self.phases_combo.addItem("1-phase", userData=1)
+        self.phases_combo.addItem("3-phase (setpoint written ×3)", userData=3)
+        self.phases_combo.currentIndexChanged.connect(
+            lambda _: setattr(b, 'phases', self.phases_combo.currentData()))
+        gl.addWidget(self.phases_combo, row, 1); row += 1
 
-        layout.addWidget(QLabel("Temperature:"), 2, 0)
-        self.temp_spin = QDoubleSpinBox()
-        self.temp_spin.setRange(-40.0, 100.0)
-        self.temp_spin.setDecimals(1)
-        self.temp_spin.setValue(self.battery.temperature_c)
-        self.temp_spin.setSuffix(" C")
-        self.temp_spin.valueChanged.connect(self._on_temp_changed)
-        layout.addWidget(self.temp_spin, 2, 1)
+        settings = [
+            ("capacity_kwh",    "Capacity:",       self._spin(0.1, 200.0, b.capacity_kwh, " kWh", lambda v: setattr(b, 'capacity_kwh', v), 1)),
+            ("soc",             "SoC:",            self._spin(0.0, 100.0, b.soc, " %", self._on_soc, 1)),
+            ("temperature_c",   "Temperature:",    self._spin(-40.0, 100.0, b.temperature_c, " °C", lambda v: setattr(b, 'temperature_c', v), 1)),
+            ("max_charge_w",    "Max charge:",     self._spin(0, 30000, b.max_charge_w, " W", lambda v: setattr(b, 'max_charge_w', v))),
+            ("max_discharge_w", "Max discharge:",  self._spin(0, 30000, b.max_discharge_w, " W", lambda v: setattr(b, 'max_discharge_w', v))),
+            ("ramp_w_per_s",    "Ramp:",           self._spin(1, 30000, b.ramp_w_per_s, " W/s", lambda v: setattr(b, 'ramp_w_per_s', v))),
+            ("delay_s",         "Response delay:", self._spin(0, 30, b.delay_s, " s", lambda v: setattr(b, 'delay_s', v))),
+        ]
+        self.spins = {}   # battery attribute -> spin box, used by the control API
+        for attr, caption, widget in settings:
+            gl.addWidget(QLabel(caption), row, 0)
+            gl.addWidget(widget, row, 1)
+            self.spins[attr] = widget
+            row += 1
+        self.soc_spin = self.spins["soc"]
 
-        layout.addWidget(QLabel("Target Power:"), 3, 0)
-        self.target_label = QLabel("0 W")
-        self.target_label.setStyleSheet("font-family: monospace;")
-        layout.addWidget(self.target_label, 3, 1)
+        gl.addWidget(QLabel("<b>Setpoint (firmware):</b>"), row, 0)
+        self.setpoint_label = QLabel("0 W")
+        gl.addWidget(self.setpoint_label, row, 1); row += 1
 
-        layout.addWidget(QLabel("Setpoints:"), 4, 0)
-        self.setpoint_label = QLabel("-")
-        self.setpoint_label.setStyleSheet("font-family: monospace;")
-        layout.addWidget(self.setpoint_label, 4, 1)
+        gl.addWidget(QLabel("<b>Actual power:</b>"), row, 0)
+        self.power_label = QLabel("0 W")
+        self.power_label.setStyleSheet("font-weight: bold;")
+        gl.addWidget(self.power_label, row, 1); row += 1
 
-        layout.addWidget(QLabel("Registers:"), 5, 0)
-        self.reg_label = QLabel("-")
-        self.reg_label.setStyleSheet("font-family: monospace;")
-        layout.addWidget(self.reg_label, 5, 1)
-
-        layout.addWidget(QLabel("Last Request:"), 6, 0)
+        gl.addWidget(QLabel("Last Request:"), row, 0)
         self.last_req_label = QLabel("None")
         self.last_req_label.setStyleSheet("font-size: 10px; color: gray;")
-        layout.addWidget(self.last_req_label, 6, 1)
+        gl.addWidget(self.last_req_label, row, 1); row += 1
 
         self.config_bar = SmartfoxConfigBar(self.api, self.smartfox_config)
-        layout.addWidget(self.config_bar, 7, 0, 1, 2)
+        gl.addWidget(self.config_bar, row, 0, 1, 2)
 
-        self.setLayout(layout)
+        self.setLayout(gl)
 
-    def _on_power_changed(self, value: int):
-        self.battery.power_w = value
-
-    def _on_soc_changed(self, value: int):
-        self.battery.soc_percent = value
-
-    def _on_temp_changed(self, value: float):
-        self.battery.temperature_c = value
+    def _on_soc(self, value):
+        self.battery.soc = value
 
     def update_display(self):
-        self.power_spin.blockSignals(True)
-        self.power_spin.setValue(self.battery.power_w)
-        self.power_spin.blockSignals(False)
-
-        self.soc_spin.blockSignals(True)
-        self.soc_spin.setValue(self.battery.soc_percent)
-        self.soc_spin.blockSignals(False)
-
-        self.temp_spin.blockSignals(True)
-        self.temp_spin.setValue(self.battery.temperature_c)
-        self.temp_spin.blockSignals(False)
-
-        reg_soc = self.battery.read_registers(self.battery.REG_SOC, 1)[0]
-        reg_power = self.battery.read_registers(self.battery.REG_POWER, 2)
-        reg_temp = self.battery.read_registers(self.battery.REG_TEMP, 1)[0]
-        self.target_label.setText(f"{self.battery.target_power_w} W")
-        self.setpoint_label.setText(
-            f"L1={self.battery.setpoint_l1_w} L2={self.battery.setpoint_l2_w} L3={self.battery.setpoint_l3_w}"
-        )
-        self.reg_label.setText(
-            f"843={reg_soc}  26={reg_power[0]} 27={reg_power[1]}  61={reg_temp}"
-        )
-        self.last_req_label.setText(
-            f"[{self.battery.last_request_time}] {self.battery.last_request_type}"
-        )
+        b = self.battery
+        regs = "/".join(str(v) for v in b.setpoint_regs)
+        self.setpoint_label.setText(f"{b.setpoint_w:+d} W   (L1/L2/L3 regs: {regs})")
+        state = "charging" if b.actual_power_w > 0 else "discharging" if b.actual_power_w < 0 else "idle"
+        self.power_label.setText(f"{int(b.actual_power_w):+d} W  ({state})")
+        if not self.soc_spin.hasFocus():
+            self.soc_spin.blockSignals(True)
+            self.soc_spin.setValue(b.soc)
+            self.soc_spin.blockSignals(False)
+        self.last_req_label.setText(f"[{b.last_request_time}] {b.last_request_type}")
 
 
 class HeaterWidget(QGroupBox):
@@ -1349,10 +1493,40 @@ class CommunityWidget(QGroupBox):
 
 
 # ---------------------------------------------------------------------------
-# Control API (http://127.0.0.1:8020) - drive the simulator from scripts / Claude
+# Control API (http://127.0.0.1:8020) - drive the simulator from scripts / Claude (mcp_server.py, API.md)
 # ---------------------------------------------------------------------------
 
 CONTROL_API_PORT = 8020
+
+
+class ApiError(Exception):
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+
+
+def _require(body: dict, key: str, kind, lo=None, hi=None, choices=None):
+    """Return body[key] validated, or None if absent."""
+    if key not in body:
+        return None
+    value = body[key]
+    if kind is float and isinstance(value, int) and not isinstance(value, bool):
+        value = float(value)
+    if kind is int and isinstance(value, float) and value.is_integer():
+        value = int(value)
+    if not isinstance(value, kind) or (kind is not bool and isinstance(value, bool)):
+        raise ApiError(400, f"'{key}' must be {kind.__name__}")
+    if choices is not None and value not in choices:
+        raise ApiError(400, f"'{key}' must be one of {list(choices)}")
+    if (lo is not None and value < lo) or (hi is not None and value > hi):
+        raise ApiError(400, f"'{key}' must be within {lo}..{hi}")
+    return value
+
+
+def _reject_unknown(body: dict, allowed: set):
+    unknown = set(body) - allowed
+    if unknown:
+        raise ApiError(400, f"Unknown field(s) {sorted(unknown)}; allowed: {sorted(allowed)}")
 
 
 class ControlApi:
@@ -1360,24 +1534,65 @@ class ControlApi:
     Local HTTP JSON API that does what the buttons do. Every request runs in the GUI thread
     (MainWindow.run_in_gui), so the window shows the same state as after a click.
 
-      GET  /state                              everything below, plus measured values
+    REST API (used by mcp_server.py, see API.md) - GET/POST/PATCH/DELETE below /api:
+      /api/state
+      /api/stations[/<id>[/plug_in|/plug_out|/error]]
+      /api/heaters[/<slot>]
+      /api/batteries[/<id>]
+      /api/grid  /api/meter[/reset]  /api/polling  /api/community  /api/smartfox
+      /api/configure                   POST {"device": "all"|"meter"|"battery"|"station"|"heater", "id": n, "remove": false}
+
+    Legacy API (kept for existing scripts, every POST returns the full legacy state):
+      GET  /state
       POST /surplus        {"w": -3000}        PV surplus input (Unit-ID 100 / meter), - = feed-in
       POST /stations       {"count": 3} | {"clear": true}
       POST /station/<id>   {"action": "plug_in"|"plug_out"|"error", "vehicle_phases": 1-3,
                             "max_power_kw": 11, "manual_amperage": 10 | null}
       POST /heater/<slot>  {"nominal_power_w", "temperature_c", "max_temp_c", "auto_temperature", "force_max_temp"}
-      POST /battery        {"power_w", "soc", "temperature_c"}
+      POST /battery        {"soc", "temperature_c", "power_w"}   first battery only
       POST /community      {"enabled": true, "others_w": -16000, "key": 0.5}
       POST /smartfox       {"ip": "192.168.100.170"}
       POST /configure      {"device": "all"|"meter"|"battery"|"station"|"heater", "id": n, "remove": false}
     """
+
+    # (method, path regex) -> method name of this class; regex groups are passed as int args
+    ROUTES = [
+        ("GET",    r"/api/state",                    "api_state"),
+        ("GET",    r"/api/stations",                 "api_list_stations"),
+        ("POST",   r"/api/stations",                 "api_add_stations"),
+        ("DELETE", r"/api/stations",                 "api_clear_stations"),
+        ("GET",    r"/api/stations/(\d+)",           "api_get_station"),
+        ("PATCH",  r"/api/stations/(\d+)",           "api_update_station"),
+        ("POST",   r"/api/stations/(\d+)/plug_in",   "api_plug_in"),
+        ("POST",   r"/api/stations/(\d+)/plug_out",  "api_plug_out"),
+        ("POST",   r"/api/stations/(\d+)/error",     "api_station_error"),
+        ("GET",    r"/api/heaters",                  "api_list_heaters"),
+        ("GET",    r"/api/heaters/(\d+)",            "api_get_heater"),
+        ("PATCH",  r"/api/heaters/(\d+)",            "api_update_heater"),
+        ("GET",    r"/api/grid",                     "api_get_grid"),
+        ("PATCH",  r"/api/grid",                     "api_update_grid"),
+        ("GET",    r"/api/meter",                    "api_get_meter"),
+        ("POST",   r"/api/meter/reset",              "api_reset_meter"),
+        ("GET",    r"/api/batteries",                "api_list_batteries"),
+        ("POST",   r"/api/batteries",                "api_add_battery"),
+        ("DELETE", r"/api/batteries",                "api_clear_batteries"),
+        ("GET",    r"/api/batteries/(\d+)",          "api_get_battery"),
+        ("PATCH",  r"/api/batteries/(\d+)",          "api_update_battery"),
+        ("GET",    r"/api/polling",                  "api_get_polling"),
+        ("PATCH",  r"/api/polling",                  "api_update_polling"),
+        ("GET",    r"/api/community",                "api_get_community"),
+        ("PATCH",  r"/api/community",                "api_update_community"),
+        ("GET",    r"/api/smartfox",                 "api_get_smartfox"),
+        ("PATCH",  r"/api/smartfox",                 "api_update_smartfox"),
+        ("POST",   r"/api/configure",                "api_configure"),
+    ]
 
     def __init__(self, window, port=CONTROL_API_PORT):
         self.window = window
         api = self
 
         class Handler(BaseHTTPRequestHandler):
-            def log_message(self, *args):
+            def log_message(self, fmt, *args):
                 pass
 
             def _reply(self, code, obj):
@@ -1392,22 +1607,50 @@ class ControlApi:
                 try:
                     length = int(self.headers.get("Content-Length") or 0)
                     body = json.loads(self.rfile.read(length) or b"{}") if length else {}
-                    parts = [x for x in self.path.split("?")[0].split("/") if x]
-                    result = api.window.run_in_gui(lambda: api.dispatch(method, parts, body))
+                    if not isinstance(body, dict):
+                        raise ApiError(400, "JSON body must be an object")
+                    path = self.path.split("?", 1)[0].rstrip("/")
+                    if path.startswith("/api"):
+                        result = api.window.run_in_gui(lambda: api.rest(method, path, body))
+                    else:
+                        parts = [x for x in path.split("/") if x]
+                        result = api.window.run_in_gui(lambda: api.dispatch(method, parts, body))
                     self._reply(200, result)
+                except ApiError as e:
+                    self._reply(e.status, {"error": str(e)})
+                except json.JSONDecodeError as e:
+                    self._reply(400, {"error": f"Invalid JSON: {e}"})
                 except (KeyError, ValueError, IndexError) as e:
                     self._reply(400, {"error": f"{type(e).__name__}: {e}"})
                 except Exception as e:
                     self._reply(500, {"error": f"{type(e).__name__}: {e}"})
 
-            def do_GET(self):  self._handle("GET")
-            def do_POST(self): self._handle("POST")
+            def do_GET(self):    self._handle("GET")
+            def do_POST(self):   self._handle("POST")
+            def do_PATCH(self):  self._handle("PATCH")
+            def do_DELETE(self): self._handle("DELETE")
 
         self.server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         print(f"[Control API] listening on http://127.0.0.1:{port}")
 
-    # ---- runs in the GUI thread ----
+    # ---- REST routing (runs in the GUI thread) ----
+
+    def rest(self, method, path, body):
+        path_matched = False
+        for route_method, pattern, handler in self.ROUTES:
+            m = re.fullmatch(pattern, path)
+            if not m:
+                continue
+            path_matched = True
+            if route_method != method:
+                continue
+            args = [int(g) for g in m.groups()]
+            fn   = getattr(self, handler)
+            return fn(*args) if method == "GET" else fn(*args, body)
+        raise ApiError(405 if path_matched else 404, f"No route for {method} {path}")
+
+    # ---- legacy routing (runs in the GUI thread) ----
 
     def dispatch(self, method, parts, body):
         w = self.window
@@ -1417,6 +1660,7 @@ class ControlApi:
             raise KeyError(f"unknown endpoint {method} /{'/'.join(parts)}")
 
         if parts == ["surplus"]:
+            w.surplus_spin.setValue(float(body["w"]))   # also triggers _on_surplus_changed
             w._on_surplus_changed(float(body["w"]))
         elif parts == ["stations"]:
             if body.get("clear"):
@@ -1453,47 +1697,418 @@ class ControlApi:
             if "force_max_temp" in body:
                 widget.force_max_check.setChecked(bool(body["force_max_temp"]))
         elif parts == ["battery"]:
-            b = w.battery
-            if "power_w" in body:       b.power_w = int(body["power_w"])
-            if "soc" in body:           b.soc_percent = int(body["soc"])
-            if "temperature_c" in body: b.temperature_c = float(body["temperature_c"])
+            if not w.batteries:
+                raise KeyError("no battery")
+            widget = self._battery_widget(w.batteries[0].battery_id)
+            b = widget.battery
+            if "soc" in body:           widget.spins["soc"].setValue(float(body["soc"]))
+            if "temperature_c" in body: widget.spins["temperature_c"].setValue(float(body["temperature_c"]))
+            if "power_w" in body:       b.actual_power_w = float(body["power_w"])   # ramps back to the firmware setpoint
         elif parts == ["community"]:
-            c = w.community_widget
-            if "others_w" in body: c.others_spin.setValue(float(body["others_w"]))
-            if "key" in body:      c.key_spin.setValue(float(body["key"]))
-            if "enabled" in body:  c.enable_cb.setChecked(bool(body["enabled"]))
+            self.api_update_community(body)
         elif parts == ["smartfox"]:
             w.smartfox_ip_edit.setText(str(body["ip"]))
         elif parts == ["configure"]:
-            self._configure(body)
+            self.api_configure(body)
         else:
             raise KeyError(f"unknown endpoint POST /{'/'.join(parts)}")
         return self.state()
 
+    # ---- widget lookup ----
+
     def _station_widget(self, station_id):
         for widget in self.window.findChildren(StationWidget):
-            if widget.station.station_id == station_id:
+            if widget.station.station_id == station_id and widget.station in self.window.stations:
                 return widget
-        raise KeyError(f"no station {station_id}")
+        raise ApiError(404, f"Station {station_id} not found")
 
-    def _configure(self, body):
+    def _battery_widget(self, battery_id):
+        for widget in self.window.findChildren(BatteryWidget):
+            if widget.battery.battery_id == battery_id and widget.battery in self.window.batteries:
+                return widget
+        raise ApiError(404, f"Battery {battery_id} not found")
+
+    def _heater_widget(self, slot):
+        if not 0 <= slot < len(self.window.heater_widgets):
+            raise ApiError(404, f"Heater {slot} not found")
+        return self.window.heater_widgets[slot]
+
+    # ---- JSON views ----
+
+    @staticmethod
+    def _station_json(s: ChargingStationSimulator) -> dict:
+        return {
+            "id":                 s.station_id,
+            "status_code":        s.status_code,
+            "status":             s.status,
+            "is_charging":        s.is_charging,
+            "power_kw":           round(s.current_power, 3),
+            "current_a":          s.current_amperage,
+            "target_current_a":   s.target_amperage,
+            "set_current_ma":     s.set_current_ma,
+            "phases":             s.phases,
+            "vehicle_phases":     s.vehicle_phases,
+            "effective_phases":   s.effective_phases,
+            "voltage_v":          s.voltage,
+            "max_power_kw":       s.max_power,
+            "manual_amperage":    s.manual_amperage,
+            "error_code":         s.error_code,
+            "energy_kwh":         round(s.energy_delivered, 4),
+            "session_duration_s": s.session_duration,
+            "last_request":       {"time": s.last_request_time, "type": s.last_request_type},
+        }
+
+    @staticmethod
+    def _battery_json(b: BatterySimulator) -> dict:
+        return {
+            "id":              b.battery_id,
+            "local_ip":        b.local_ip,
+            "phases":          b.phases,
+            "capacity_kwh":    b.capacity_kwh,
+            "soc":             round(b.soc, 3),
+            "max_charge_w":    b.max_charge_w,
+            "max_discharge_w": b.max_discharge_w,
+            "ramp_w_per_s":    b.ramp_w_per_s,
+            "delay_s":         b.delay_s,
+            "temperature_c":   b.temperature_c,
+            "setpoint_w":      b.setpoint_w,
+            "setpoint_regs":   list(b.setpoint_regs),
+            "actual_power_w":  round(b.actual_power_w, 1),
+            "last_request":    {"time": b.last_request_time, "type": b.last_request_type},
+        }
+
+    def _heater_json(self, h: HeaterSimulator, widget) -> dict:
+        return {
+            "slot": h.slot, "unit_id": h.unit_id, "nominal_power_w": h.nominal_power_w,
+            "setpoint_w": h.setpoint_w, "power_w": int(h.power_w),
+            "state": HeaterSimulator.STATE_NAMES.get(h.state),
+            "temperature_c": round(h.temperature_c, 1), "max_temp_c": h.max_temp_c,
+            "auto_temperature": h.auto_temperature, "force_max_temp": h.force_max_temp,
+            "energy_wh": round(h.energy_wh, 1),
+            "last_request": {"time": h.last_request_time, "type": h.last_request_type},
+            "config_status": widget.config_bar.status,
+        }
+
+    # ---- REST handlers: state ----
+
+    def api_state(self) -> dict:
         w = self.window
-        device = body.get("device", "all")
+        return {
+            "modbus_ports": list(MODBUS_PORTS),
+            "sim_ip":       w.ip_combo.currentText(),
+            "grid":         self.api_get_grid(),
+            "meter":        self.api_get_meter(),
+            "stations":     self.api_list_stations(),
+            "heaters":      self.api_list_heaters(),
+            "batteries":    self.api_list_batteries(),
+            "polling":      self.api_get_polling(),
+            "community":    self.api_get_community(),
+            "smartfox":     self.api_get_smartfox(),
+        }
+
+    # ---- stations ----
+
+    def api_list_stations(self) -> list:
+        return [self._station_json(s) for s in self.window.stations]
+
+    def api_get_station(self, station_id: int) -> dict:
+        return self._station_json(self._station_widget(station_id).station)
+
+    def api_add_stations(self, body: dict) -> list:
+        _reject_unknown(body, {"count"})
+        count  = _require(body, "count", int, 1, 16) or 1
+        w      = self.window
+        before = len(w.stations)
+        w.station_count_spin.setValue(count)
+        w.add_stations()
+        return [self._station_json(s) for s in w.stations[before:]]
+
+    def api_clear_stations(self, body: dict) -> dict:
+        self.window.clear_stations()
+        return {"ok": True}
+
+    def api_plug_in(self, station_id: int, body: dict) -> dict:
+        widget = self._station_widget(station_id)
+        if widget.station.status_code == ChargingStationSimulator.STATUS_ERROR:
+            raise ApiError(409, "Station is in error state, plug out first")
+        widget.on_plug_in()
+        return self._station_json(widget.station)
+
+    def api_plug_out(self, station_id: int, body: dict) -> dict:
+        widget = self._station_widget(station_id)
+        widget.on_plug_out()
+        return self._station_json(widget.station)
+
+    def api_station_error(self, station_id: int, body: dict) -> dict:
+        _reject_unknown(body, {"error_code"})
+        widget = self._station_widget(station_id)
+        widget.on_error()
+        error_code = _require(body, "error_code", int, 0, 0xFFFF)
+        if error_code is not None:
+            widget.station.error_code = error_code
+        return self._station_json(widget.station)
+
+    def api_update_station(self, station_id: int, body: dict) -> dict:
+        _reject_unknown(body, {"status_code", "max_power_kw", "amperage_a", "manual_amperage", "error_code",
+                               "vehicle_phases"})
+        widget  = self._station_widget(station_id)
+        station = widget.station
+        status  = _require(body, "status_code", int, choices=ChargingStationSimulator.STATUS_NAMES)
+        max_kw  = _require(body, "max_power_kw", float, 1.0, 22.0)
+        amps    = _require(body, "amperage_a", float, 0.0, 32.0)
+        manual  = _require(body, "manual_amperage", bool)
+        error   = _require(body, "error_code", int, 0, 0xFFFF)
+        vphases = _require(body, "vehicle_phases", int, choices=(1, 2, 3))
+        if status is not None:
+            station.set_status(status)
+        if max_kw is not None:
+            widget.max_power_spin.setValue(max_kw)
+        if amps is not None:
+            widget.amperage_spin.setValue(amps)
+            widget.update_amperage(amps)   # also when the spin already shows this value
+        if manual is not None:
+            widget.manual_checkbox.setChecked(manual)
+        if error is not None:
+            station.error_code = error
+        if vphases is not None:
+            station.vehicle_phases = vphases
+        widget.update_display()
+        return self._station_json(station)
+
+    # ---- heaters ----
+
+    def api_list_heaters(self) -> list:
+        w = self.window
+        return [self._heater_json(h, hw) for h, hw in zip(w.heaters, w.heater_widgets)]
+
+    def api_get_heater(self, slot: int) -> dict:
+        widget = self._heater_widget(slot)
+        return self._heater_json(widget.heater, widget)
+
+    def api_update_heater(self, slot: int, body: dict) -> dict:
+        _reject_unknown(body, {"nominal_power_w", "temperature_c", "max_temp_c", "auto_temperature", "force_max_temp"})
+        widget  = self._heater_widget(slot)
+        nominal = _require(body, "nominal_power_w", int, 0, 30000)
+        temp    = _require(body, "temperature_c", float, 0.0, 99.0)
+        max_t   = _require(body, "max_temp_c", float, 20.0, 99.0)
+        auto    = _require(body, "auto_temperature", bool)
+        force   = _require(body, "force_max_temp", bool)
+        if nominal is not None: widget.nominal_spin.setValue(nominal)
+        if temp is not None:    widget.temp_spin.setValue(temp)
+        if max_t is not None:   widget.max_temp_spin.setValue(max_t)
+        if auto is not None:    widget.auto_temp_check.setChecked(auto)
+        if force is not None:   widget.force_max_check.setChecked(force)
+        return self._heater_json(widget.heater, widget)
+
+    # ---- grid / surplus ----
+
+    def api_get_grid(self) -> dict:
+        w = self.window
+        return {
+            "surplus_input_w":     w._base_surplus,
+            "surplus_effective_w": w.surplus_power,
+            "grid_total_w":        w.meter_total_w(),
+            "unit100_w":           round(w.grid_power_w(), 1),
+            "charger_total_w":     round(sum(s.current_power * 1000 for s in w.stations), 1),
+            "heater_total_w":      round(sum(h.power_w for h in w.heaters), 1),
+            "battery_total_w":     round(w.battery_total_w(), 1),
+            "noise_enabled":       w.noise_cb.isChecked(),
+            "noise_amplitude_w":   w.noise_spin.value(),
+            "noise_w":             round(w.noise_w, 1),
+        }
+
+    def api_update_grid(self, body: dict) -> dict:
+        _reject_unknown(body, {"surplus_w", "noise_enabled", "noise_amplitude_w"})
+        w         = self.window
+        surplus   = _require(body, "surplus_w", float, -32768.0, 32767.0)
+        noise_on  = _require(body, "noise_enabled", bool)
+        amplitude = _require(body, "noise_amplitude_w", int, 0, 10000)
+        if surplus is not None:
+            if w.poller and w.surplus_source_combo.currentData():
+                raise ApiError(409, "Surplus is driven by device polling; set polling surplus_source to null first")
+            w.surplus_spin.setValue(surplus)
+            w._on_surplus_changed(surplus)
+        if noise_on is not None:
+            w.noise_cb.setChecked(noise_on)
+        if amplitude is not None:
+            w.noise_spin.setValue(amplitude)
+        return self.api_get_grid()
+
+    # ---- meter ----
+
+    def api_get_meter(self) -> dict:
+        m = self.window.meter
+        return {
+            "total_power_w":     m.total_power_w,
+            "phase_powers_w":    list(m.phase_powers_w),
+            "phase_currents_ma": list(m.phase_currents_ma),
+            "energy_forward_wh": round(m.energy_forward_wh, 3),
+            "energy_reverse_wh": round(m.energy_reverse_wh, 3),
+            "smartfox_slot":     self.window.meter_widget.slot_spin.value(),
+            "last_request":      {"time": m.last_request_time, "type": m.last_request_type},
+            "config_status":     self.window.meter_widget.config_bar.status,
+        }
+
+    def api_reset_meter(self, body: dict) -> dict:
+        _reject_unknown(body, {"forward", "reverse"})
+        m = self.window.meter
+        if _require(body, "forward", bool) is not False:
+            m.energy_forward_wh = 0.0
+        if _require(body, "reverse", bool) is not False:
+            m.energy_reverse_wh = 0.0
+        return self.api_get_meter()
+
+    # ---- batteries ----
+
+    def api_list_batteries(self) -> list:
+        return [self._battery_json(b) for b in self.window.batteries]
+
+    def api_get_battery(self, battery_id: int) -> dict:
+        return self._battery_json(self._battery_widget(battery_id).battery)
+
+    def api_add_battery(self, body: dict) -> dict:
+        w = self.window
+        w.add_battery()
+        battery = w.batteries[-1]
+        if body:
+            return self.api_update_battery(battery.battery_id, body)
+        return self._battery_json(battery)
+
+    def api_clear_batteries(self, body: dict) -> dict:
+        self.window.clear_batteries()
+        return {"ok": True}
+
+    def api_update_battery(self, battery_id: int, body: dict) -> dict:
+        limits = {
+            "capacity_kwh":    (float, 0.1, 200.0),
+            "soc":             (float, 0.0, 100.0),
+            "temperature_c":   (float, -40.0, 100.0),
+            "max_charge_w":    (int, 0, 30000),
+            "max_discharge_w": (int, 0, 30000),
+            "ramp_w_per_s":    (int, 1, 30000),
+            "delay_s":         (int, 0, 30),
+        }
+        _reject_unknown(body, set(limits) | {"phases", "local_ip"})
+        widget  = self._battery_widget(battery_id)
+        values  = {k: _require(body, k, *spec) for k, spec in limits.items()}
+        phases  = _require(body, "phases", int, choices=(1, 3))
+        ip      = _require(body, "local_ip", str)
+        for attr, value in values.items():
+            if value is not None:
+                widget.spins[attr].setValue(value)
+                setattr(widget.battery, attr, value)
+        if phases is not None:
+            widget.phases_combo.setCurrentIndex(widget.phases_combo.findData(phases))
+        if ip is not None:
+            widget.ip_edit.setText(ip.strip())
+        widget.update_display()
+        return self._battery_json(widget.battery)
+
+    # ---- device polling (Smartfox JSON API, IP = Smartfox-IP) ----
+
+    def api_get_polling(self) -> dict:
+        w = self.window
+        values, poll_time, error = w.poller.get() if w.poller else ({}, None, None)
+        return {
+            "enabled":           w.poller is not None,
+            "ip":                w.smartfox_ip_edit.text().strip(),
+            "interval_s":        w.poll_interval_spin.value(),
+            "surplus_source":    w.surplus_source_combo.currentData(),
+            "heater_in_surplus": w.heater_in_surplus_cb.isChecked(),
+            "last_poll_time":    poll_time,
+            "last_error":        error,
+            "values":            values,
+        }
+
+    def api_update_polling(self, body: dict) -> dict:
+        _reject_unknown(body, {"enabled", "ip", "interval_s", "surplus_source", "heater_in_surplus"})
+        w        = self.window
+        sources  = [w.surplus_source_combo.itemData(i) for i in range(w.surplus_source_combo.count())]
+        enabled  = _require(body, "enabled", bool)
+        ip       = _require(body, "ip", str)
+        interval = _require(body, "interval_s", int, 1, 60)
+        heater   = _require(body, "heater_in_surplus", bool)
+        if "surplus_source" in body and body["surplus_source"] not in sources:
+            raise ApiError(400, f"'surplus_source' must be one of {sources}")
+        if (ip is not None or interval is not None) and w.poller and enabled is not False:
+            raise ApiError(409, "Disable polling before changing ip/interval_s")
+        if enabled is False:
+            w.poll_enable_cb.setChecked(False)
+        if ip is not None:
+            w.smartfox_ip_edit.setText(ip.strip())
+        if interval is not None:
+            w.poll_interval_spin.setValue(interval)
+        if "surplus_source" in body:
+            w.surplus_source_combo.setCurrentIndex(sources.index(body["surplus_source"]))
+        if heater is not None:
+            w.heater_in_surplus_cb.setChecked(heater)
+        if enabled:
+            if not w.smartfox_ip_edit.text().strip():
+                raise ApiError(400, "Set 'ip' to enable polling")
+            w.poll_enable_cb.setChecked(True)
+        return self.api_get_polling()
+
+    # ---- energy community ----
+
+    def api_get_community(self) -> dict:
+        c = self.window.community_widget
+        delayed_own, community_power, my_surplus = c._values()
+        return {
+            "enabled": c.enable_cb.isChecked(), "others_w": c.others_spin.value(), "key": c.key_spin.value(),
+            "own_delayed_w": delayed_own, "community_power": community_power, "my_surplus": my_surplus,
+            "expected_share_w": -c.key_spin.value() * c.others_spin.value(),
+            "last_result": c.last_result,
+        }
+
+    def api_update_community(self, body: dict) -> dict:
+        _reject_unknown(body, {"enabled", "others_w", "key"})
+        c       = self.window.community_widget
+        others  = _require(body, "others_w", float, -100000.0, 100000.0)
+        key     = _require(body, "key", float, 0.0, 1.0)
+        enabled = _require(body, "enabled", bool)
+        if others is not None:  c.others_spin.setValue(others)
+        if key is not None:     c.key_spin.setValue(key)
+        if enabled is not None: c.enable_cb.setChecked(enabled)
+        return self.api_get_community()
+
+    # ---- Smartfox under test ----
+
+    def api_get_smartfox(self) -> dict:
+        w = self.window
+        return {"smartfox_ip": w.smartfox_ip_edit.text(), "sim_ip": w.ip_combo.currentText()}
+
+    def api_update_smartfox(self, body: dict) -> dict:
+        _reject_unknown(body, {"ip"})
+        ip = _require(body, "ip", str)
+        if ip is not None:
+            self.window.smartfox_ip_edit.setText(ip.strip())
+        return self.api_get_smartfox()
+
+    def api_configure(self, body: dict) -> dict:
+        """Writes the device configuration to the Smartfox flash (same as the 'Konfigurieren' buttons)."""
+        _reject_unknown(body, {"device", "id", "remove"})
+        w      = self.window
+        device = _require(body, "device", str, choices=("all", "meter", "battery", "station", "heater")) or "all"
+        ident  = _require(body, "id", int)
+        remove = _require(body, "remove", bool)
         if device == "all":
             w.configure_all()
-            return
-        bars = {
+            return {"ok": True, "device": "all"}
+        if device != "meter" and ident is None:
+            raise ApiError(400, f"'id' is required for device '{device}'")
+        bar = {
             "meter":   lambda: w.meter_widget.config_bar,
-            "battery": lambda: w.battery_widget.config_bar,
-            "station": lambda: self._station_widget(int(body["id"])).config_bar,
-            "heater":  lambda: w.heater_widgets[int(body["id"])].config_bar,
-        }
-        bar = bars[device]()
-        bar.remove() if body.get("remove") else bar.configure()
+            "battery": lambda: self._battery_widget(ident).config_bar,
+            "station": lambda: self._station_widget(ident).config_bar,
+            "heater":  lambda: self._heater_widget(ident).config_bar,
+        }[device]()
+        bar.remove() if remove else bar.configure()
+        return {"ok": True, "device": device, "id": ident}
+
+    # ---- legacy state ----
 
     def state(self):
         w = self.window
-        c = w.community_widget
         stations = []
         for st in w.stations:
             widget = self._station_widget(st.station_id)
@@ -1513,24 +2128,19 @@ class ControlApi:
             "last_request": f"[{h.last_request_time}] {h.last_request_type}",
             "config_status": hw.config_bar.status,
         } for h, hw in zip(w.heaters, w.heater_widgets)]
-        b = w.battery
-        delayed_own, community_power, my_surplus = c._values()
+        batteries = []
+        for b in w.batteries:
+            item = self._battery_json(b)
+            item["config_status"] = self._battery_widget(b.battery_id).config_bar.status
+            batteries.append(item)
         return {
             "sim_ip": w.ip_combo.currentText(), "smartfox_ip": w.smartfox_ip_edit.text(),
             "surplus_w": w.surplus_power, "grid_w": w.grid_power_w(), "meter_total_w": w.meter.total_power_w,
-            "stations": stations, "heaters": heaters,
-            "battery": {"power_w": b.power_w, "target_power_w": b.target_power_w, "soc": b.soc_percent,
-                        "temperature_c": b.temperature_c,
-                        "setpoints_w": [b.setpoint_l1_w, b.setpoint_l2_w, b.setpoint_l3_w],
-                        "config_status": w.battery_widget.config_bar.status},
+            "stations": stations, "heaters": heaters, "batteries": batteries,
             "meter": {"total_power_w": w.meter.total_power_w, "phase_powers_w": w.meter.phase_powers_w,
                       "smartfox_slot": w.meter_widget.slot_spin.value(),
                       "config_status": w.meter_widget.config_bar.status},
-            "community": {"enabled": c.enable_cb.isChecked(), "others_w": c.others_spin.value(),
-                          "key": c.key_spin.value(), "own_delayed_w": delayed_own,
-                          "community_power": community_power, "my_surplus": my_surplus,
-                          "expected_share_w": -c.key_spin.value() * c.others_spin.value(),
-                          "last_result": c.last_result},
+            "community": self.api_get_community(),
         }
 
 
@@ -1543,10 +2153,13 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.stations      = []
+        self.batteries: list[BatterySimulator] = []
+        self.noise_w       = 0.0   # current random load noise, re-drawn every second
         self.server_thread = None
-        self.surplus_power = 0.0
+        self._base_surplus = 0.0   # raw spinner / polled source value
+        self.surplus_power = 0.0   # effective = _base_surplus + heater offset
         self.meter         = SmartfoxSlaveSimulator()
-        self.battery       = ModbusTcpBatterySimulator()
+        self.poller: DevicePoller | None = None
         self.heaters       = [HeaterSimulator(slot) for slot in range(HEATER_COUNT)]
         # Widgets are read when a button is clicked, so the lambdas may refer to them before setup_ui()
         self.api           = SmartfoxApi(lambda: self.smartfox_ip_edit.text(), lambda: self.ip_combo.currentText())
@@ -1555,6 +2168,7 @@ class MainWindow(QMainWindow):
         self.start_servers()
         self.start_update_timer()
         self.add_stations()
+        self.add_battery()
 
     def setup_ui(self):
         self.setWindowTitle("EV Charging Station + Smartfox Slave + Victron Battery + Heater Simulator")
@@ -1573,7 +2187,7 @@ class MainWindow(QMainWindow):
         self.ip_combo.setFixedWidth(150)
         self.ip_combo.currentTextChanged.connect(self._on_ip_changed)
         info_layout.addWidget(self.ip_combo)
-        info_layout.addWidget(QLabel(":5020 / :502   (chargers: unit-ID = station ID  |  heaters: unit-ID 210-212  |  Victron battery: unit-ID 242  |  meter: addr ≥ 40000)"))
+        info_layout.addWidget(QLabel(":5020 / :502   (chargers: unit-ID = station ID  |  heaters: unit-ID 210-212  |  Victron battery: unit-ID 0/242/246/227  |  meter: addr ≥ 40000)"))
         copy_btn = QPushButton("Copy")
         copy_btn.setFixedWidth(50)
         copy_btn.clicked.connect(self._copy_ip)
@@ -1658,10 +2272,48 @@ class MainWindow(QMainWindow):
         # Battery tab
         battery_tab = QWidget()
         battery_layout = QVBoxLayout(battery_tab)
-        self.battery_widget = BatteryWidget(self.battery, self.api)
-        battery_layout.addWidget(self.battery_widget)
-        battery_layout.addStretch()
-        tabs.addTab(battery_tab, "Victron Battery (Unit-ID 242)")
+
+        batt_ctrl = QHBoxLayout()
+        add_batt_btn = QPushButton("Add Battery")
+        add_batt_btn.clicked.connect(self.add_battery)
+        batt_ctrl.addWidget(add_batt_btn)
+        clear_batt_btn = QPushButton("Clear Batteries")
+        clear_batt_btn.clicked.connect(self.clear_batteries)
+        batt_ctrl.addWidget(clear_batt_btn)
+
+        noise_group = QGroupBox("Load noise (added to grid power)")
+        noise_layout = QHBoxLayout()
+        noise_layout.setContentsMargins(6, 4, 6, 4)
+        self.noise_cb = QCheckBox("Enable")
+        noise_layout.addWidget(self.noise_cb)
+        noise_layout.addWidget(QLabel("± amplitude:"))
+        self.noise_spin = QSpinBox()
+        self.noise_spin.setRange(0, 10000)
+        self.noise_spin.setValue(150)
+        self.noise_spin.setSuffix(" W")
+        noise_layout.addWidget(self.noise_spin)
+        self.noise_label = QLabel("0 W")
+        self.noise_label.setStyleSheet("font-family: monospace;")
+        noise_layout.addWidget(self.noise_label)
+        noise_group.setLayout(noise_layout)
+        batt_ctrl.addWidget(noise_group)
+        batt_ctrl.addStretch()
+        battery_layout.addLayout(batt_ctrl)
+
+        battery_layout.addWidget(QLabel(
+            "Firmware: product Victron VE CTRL (bs_victron.c, port 502 or 5020), IP = this PC. "
+            "Several batteries: give each its own local IP (IP alias on this PC)."
+        ))
+
+        batt_scroll = QScrollArea()
+        batt_scroll.setWidgetResizable(True)
+        self.batteries_container = QWidget()
+        self.batteries_layout = QHBoxLayout(self.batteries_container)
+        self.batteries_layout.addStretch()
+        batt_scroll.setWidget(self.batteries_container)
+        battery_layout.addWidget(batt_scroll)
+
+        tabs.addTab(battery_tab, "Victron Batteries (Unit-ID 0/242/246/227)")
 
         # Heater tab
         heater_tab = QWidget()
@@ -1682,14 +2334,94 @@ class MainWindow(QMainWindow):
         community_layout.addStretch()
         tabs.addTab(community_tab, "Energiegemeinschaft")
 
+        # Device polling tab (reads the real Smartfox JSON API at the Smartfox-IP above)
+        poll_tab = QWidget()
+        poll_outer = QVBoxLayout(poll_tab)
+
+        conn_group = QGroupBox("Device Connection (IP = Smartfox-IP above)")
+        conn_gl = QGridLayout()
+        conn_gl.addWidget(QLabel("Interval (s):"), 0, 0)
+        self.poll_interval_spin = QSpinBox()
+        self.poll_interval_spin.setRange(1, 60)
+        self.poll_interval_spin.setValue(5)
+        conn_gl.addWidget(self.poll_interval_spin, 0, 1)
+        self.poll_enable_cb = QCheckBox("Enable polling")
+        self.poll_enable_cb.stateChanged.connect(self._on_poll_toggle)
+        conn_gl.addWidget(self.poll_enable_cb, 1, 0, 1, 2)
+        conn_group.setLayout(conn_gl)
+        poll_outer.addWidget(conn_group)
+
+        apply_group = QGroupBox("Auto-apply to simulator")
+        apply_gl = QGridLayout()
+        apply_gl.addWidget(QLabel("Surplus source:"), 0, 0)
+        self.surplus_source_combo = QComboBox()
+        self.surplus_source_combo.addItem("Manual (disabled)", userData=None)
+        self.surplus_source_combo.addItem("detailsPowerValue  (W, pos=consuming)", userData="detailsPowerValue_neg")
+        self.surplus_source_combo.addItem("toGridValue  (kW, pos=feeding/surplus)", userData="toGridValue_kw")
+        apply_gl.addWidget(self.surplus_source_combo, 0, 1)
+        self.heater_in_surplus_cb = QCheckBox("Add heater + analog output power to surplus (×1000 → W)")
+        self.heater_in_surplus_cb.setToolTip(
+            "Adds consumptionControl1/2/3Power and analogOutPower (kW × 1000)\n"
+            "to the surplus, making that power available again for car charging."
+        )
+        apply_gl.addWidget(self.heater_in_surplus_cb, 1, 0, 1, 2)
+        apply_group.setLayout(apply_gl)
+        poll_outer.addWidget(apply_group)
+
+        vals_group = QGroupBox("Polled Values")
+        vals_gl = QGridLayout()
+        vals_gl.addWidget(QLabel("<b>Status:</b>"), 0, 0)
+        self.poll_status_label = QLabel("Idle")
+        vals_gl.addWidget(self.poll_status_label, 0, 1)
+        self._poll_labels: dict[str, QLabel] = {}
+        _display_fields = [
+            ("detailsPowerValue", "Total Power (W)"),
+            ("toGridValue",       "Grid Power (kW)"),
+            ("powerL1Value",      "Power L1 (W)"),
+            ("powerL2Value",      "Power L2 (W)"),
+            ("powerL3Value",      "Power L3 (W)"),
+            ("ampereL1Value",     "Current L1 (A)"),
+            ("ampereL2Value",     "Current L2 (A)"),
+            ("ampereL3Value",     "Current L3 (A)"),
+            ("cc1Power",          "CC1 Power (kW)"),
+            ("cc2Power",          "CC2 Power (kW)"),
+            ("cc3Power",          "CC3 Power (kW)"),
+            ("cc4Power",          "CC4 Power (kW)"),
+            ("cc5Power",          "CC5 Power (kW)"),
+            ("hidCcSt1",                  "CC1 State"),
+            ("hidCcSt2",                  "CC2 State"),
+            ("hidCcSt3",                  "CC3 State"),
+            ("hidCcSt4",                  "CC4 State"),
+            ("hidCcSt5",                  "CC5 State"),
+            ("consumptionControl1Power",  "Heater 1 Power"),
+            ("consumptionControl2Power",  "Heater 2 Power"),
+            ("consumptionControl3Power",  "Heater 3 Power"),
+            ("analogOutPower",            "Analogausgang (kW)"),
+            ("batt1Power",                "Battery 1 Power (W)"),
+            ("batt2Power",                "Battery 2 Power (W)"),
+            ("batt3Power",                "Battery 3 Power (W)"),
+        ]
+        for row, (fid, caption) in enumerate(_display_fields, start=1):
+            vals_gl.addWidget(QLabel(f"{caption}:"), row, 0)
+            lbl = QLabel("—")
+            lbl.setStyleSheet("font-family: monospace;")
+            vals_gl.addWidget(lbl, row, 1)
+            self._poll_labels[fid] = lbl
+        vals_group.setLayout(vals_gl)
+        vals_scroll = QScrollArea()
+        vals_scroll.setWidget(vals_group)
+        vals_scroll.setWidgetResizable(True)
+        poll_outer.addWidget(vals_scroll)
+        tabs.addTab(poll_tab, "Device Polling")
+
         main_layout.addWidget(tabs)
 
     @staticmethod
     def _get_local_ips():
         """Return all non-loopback IPv4 addresses from all network interfaces."""
-        import netifaces
         ips = []
         try:
+            import netifaces   # optional: no wheel for newer Pythons, socket fallback below
             for iface in netifaces.interfaces():
                 addrs = netifaces.ifaddresses(iface)
                 if netifaces.AF_INET in addrs:
@@ -1730,12 +2462,12 @@ class MainWindow(QMainWindow):
             self.stations_layout.addWidget(widget, row, col)
 
     def configure_all(self):
-        """Grid meter, all stations (up to the Smartfox slots), heaters and battery. Heater 0 first:
+        """Grid meter, all stations (up to the Smartfox slots), heaters and batteries. Heater 0 first:
         slots 1/2 only start on a change when slot 0 is a debug heater already."""
         bars = [self.meter_widget.config_bar]
         bars += [w.config_bar for w in self.findChildren(StationWidget) if w.station.station_id <= SF_CC_SLOTS]
         bars += [w.config_bar for w in self.heater_widgets]
-        bars.append(self.battery_widget.config_bar)
+        bars += [w.config_bar for w in self.findChildren(BatteryWidget) if w.battery in self.batteries]
         # One after another (parallel POSTs would collide in the small httpd); the bars read Qt widgets,
         # so they are started from a GUI-thread timer, not from a worker thread.
         self._config_queue = bars
@@ -1754,6 +2486,21 @@ class MainWindow(QMainWindow):
             return
         self._config_current = self._config_queue.pop(0)
         self._config_current.configure()
+
+    def add_battery(self):
+        battery = BatterySimulator(len(self.batteries) + 1)
+        self.batteries.append(battery)
+        self.batteries_layout.insertWidget(self.batteries_layout.count() - 1, BatteryWidget(battery, self.api))
+
+    def clear_batteries(self):
+        self.batteries.clear()
+        while self.batteries_layout.count() > 1:
+            widget = self.batteries_layout.takeAt(0).widget()
+            if widget:
+                widget.deleteLater()
+
+    def battery_total_w(self) -> float:
+        return sum(b.actual_power_w for b in self.batteries)
 
     def clear_stations(self):
         self.stations.clear()
@@ -1804,9 +2551,73 @@ class MainWindow(QMainWindow):
         """Copy selected IP to clipboard."""
         QApplication.clipboard().setText(self.ip_combo.currentText())
 
+    def _dac_offset_w(self, values: dict) -> float:
+        if not self.heater_in_surplus_cb.isChecked():
+            return 0.0
+        return values.get("analogOutPower", 0.0) * 1000.0
+
+    def _heater_offset_w(self, values: dict) -> float:
+        if not self.heater_in_surplus_cb.isChecked():
+            return 0.0
+        return sum(values.get(f"consumptionControl{i}Power", 0.0) * 1000.0 for i in range(1, 4))
+
+    def _recompute_effective_surplus(self):
+        values = {}
+        if self.poller:
+            values, _, _ = self.poller.get()
+        self.surplus_power = self._base_surplus + self._heater_offset_w(values) + self._dac_offset_w(values)
+
     def _on_surplus_changed(self, value: float):
-        self.surplus_power = value
+        self._base_surplus = value
+        self._recompute_effective_surplus()
         self.update_surplus_display()
+
+    def _on_poll_toggle(self, state):
+        if state == Qt.CheckState.Checked.value:
+            ip       = self.smartfox_ip_edit.text().strip()
+            interval = self.poll_interval_spin.value()
+            if not ip:
+                self.poll_enable_cb.blockSignals(True)
+                self.poll_enable_cb.setChecked(False)
+                self.poll_enable_cb.blockSignals(False)
+                self.poll_status_label.setText("Error: no Smartfox-IP entered")
+                self.poll_status_label.setStyleSheet("color: red;")
+                return
+            self.poller = DevicePoller(ip, interval)
+            self.poller.start()
+            self.poll_interval_spin.setEnabled(False)
+        else:
+            if self.poller:
+                self.poller.stop()
+                self.poller = None
+            self.poll_interval_spin.setEnabled(True)
+            self.poll_status_label.setText("Idle")
+            self.poll_status_label.setStyleSheet("")
+            self._recompute_effective_surplus()
+
+    def _update_poll_display(self):
+        if self.poller is None:
+            return
+        values, poll_time, error = self.poller.get()
+
+        if error:
+            self.poll_status_label.setText(f"Error: {error}")
+            self.poll_status_label.setStyleSheet("color: red;")
+        else:
+            self.poll_status_label.setText(f"OK  @ {poll_time}")
+            self.poll_status_label.setStyleSheet("color: green;")
+
+        for fid, lbl in self._poll_labels.items():
+            val = values.get(fid)
+            lbl.setText(str(val) if val is not None else "—")
+
+        source = self.surplus_source_combo.currentData()
+        if source == "detailsPowerValue_neg" and "detailsPowerValue" in values:
+            self._base_surplus = -values["detailsPowerValue"]
+        elif source == "toGridValue_kw" and "toGridValue" in values:
+            self._base_surplus = values["toGridValue"] * 1000.0
+
+        self.surplus_power = self._base_surplus + self._heater_offset_w(values) + self._dac_offset_w(values)
 
     def _compute_phase_values(self):
         """Build per-phase power (W) and current (mA) from chargers, battery and positive surplus."""
@@ -1829,16 +2640,6 @@ class MainWindow(QMainWindow):
                 phase_powers[i]   += power_w
                 phase_currents[i] += current_ma
 
-        battery_phase_indices = []
-        if self.battery.setpoint_l1_w != 0:
-            battery_phase_indices.append(0)
-        if self.battery.setpoint_l2_w != 0:
-            battery_phase_indices.append(1)
-        if self.battery.setpoint_l3_w != 0:
-            battery_phase_indices.append(2)
-        if not battery_phase_indices:
-            battery_phase_indices = [0]
-
         # Heaters: spread evenly across all 3 phases
         heater_total_w = sum(int(h.power_w) for h in self.heaters)
         if heater_total_w:
@@ -1846,21 +2647,27 @@ class MainWindow(QMainWindow):
                 phase_powers[i]   += int(heater_total_w / 3)
                 phase_currents[i] += int((heater_total_w / 3) / 230.0 * 1000.0)
 
-        battery_power_per_phase = int(self.battery.power_w / len(battery_phase_indices))
-        battery_current_ma = int((battery_power_per_phase / 230.0) * 1000.0)
-        for i in battery_phase_indices:
-            phase_powers[i] += battery_power_per_phase
-            phase_currents[i] += battery_current_ma
+        # bs_victron.c writes the same setpoint to every phase register: 3-phase batteries split evenly
+        for b in self.batteries:
+            if b.phases == 3:
+                for i in range(3):
+                    phase_powers[i]   += int(b.actual_power_w / 3)
+                    phase_currents[i] += int((b.actual_power_w / 3) / 230.0 * 1000.0)
+            else:
+                phase_powers[0]   += int(b.actual_power_w)
+                phase_currents[0] += int(b.actual_power_w / 230.0 * 1000.0)
+        for i in range(3):
+            phase_powers[i] += int(self.noise_w / 3)
 
         self.meter.phase_powers_w    = phase_powers
         self.meter.phase_currents_ma = phase_currents
 
     def update_surplus_display(self):
-        self.surplus_display.setText(f"{int(self.surplus_power):+d} W")
+        self.surplus_display.setText(f"{int(self._base_surplus):+d} W")
         self.surplus_spin.blockSignals(True)
-        self.surplus_spin.setValue(self.surplus_power)
+        self.surplus_spin.setValue(self._base_surplus)
         self.surplus_spin.blockSignals(False)
-        result_w        = int(self.surplus_power + self.consumer_total_w() + self.battery.power_w)
+        result_w        = self.meter_total_w()
         self.surplus_result_label.setText(f"{result_w:+d} W")
         self.meter.total_power_w = result_w
         self._compute_phase_values()
@@ -1869,6 +2676,10 @@ class MainWindow(QMainWindow):
         """Our grid power as Unit-ID 100 reports it (W, + = import, - = feed-in)."""
         return self.surplus_power + self.consumer_total_w()
 
+    def meter_total_w(self) -> int:
+        """Grid power the meter reports (+ = import): surplus + chargers + heaters + batteries + noise."""
+        return int(self.surplus_power + self.consumer_total_w() + self.battery_total_w() + self.noise_w)
+
     def consumer_total_w(self) -> float:
         """Power of all simulated consumers (chargers + heaters) in W."""
         charger_total_w = sum(s.current_power * 1000 for s in self.stations)
@@ -1876,9 +2687,9 @@ class MainWindow(QMainWindow):
         return charger_total_w + heater_total_w
 
     def update_all(self):
+        self._update_batteries()
         for station in self.stations:
             station.update()
-        self.battery.update()
         for heater in self.heaters:
             heater.update()
         for widget in self.heater_widgets:
@@ -1887,10 +2698,19 @@ class MainWindow(QMainWindow):
             widget.update_display()
 
         self.meter.update()          # energy accumulation uses total_power_w from last cycle
+        self._update_poll_display()  # apply polled values before recomputing totals
         self.update_surplus_display()  # set new total + phase values for this cycle
         self.meter_widget.update_display()
-        self.battery_widget.update_display()
         self.community_widget.tick_1s()
+
+    def _update_batteries(self):
+        for battery in self.batteries:
+            battery.update()
+        for widget in self.findChildren(BatteryWidget):
+            widget.update_display()
+        amplitude = self.noise_spin.value()
+        self.noise_w = random.uniform(-amplitude, amplitude) if self.noise_cb.isChecked() else 0.0
+        self.noise_label.setText(f"{int(self.noise_w):+d} W")
 
 
 def main():

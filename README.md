@@ -46,19 +46,20 @@ Die aktive Host-IP wird oben rechts im Fenster angezeigt (Button "Copy IP" kopie
 |-----------|------|
 | Host | IP aus der Titelleiste |
 | Port | 5020 |
-| Unit ID | Station-ID (1, 2, 3, …), Victron-Batterie `242`, Überschuss `100` |
+| Unit ID | Station-ID (1, 2, 3, …), Victron-Batterie `0` / `242` / `246` / `227`, Heizstab `210`-`212`, Überschuss `100` |
 
 Alle Stationen laufen auf demselben Port und werden über die Unit ID unterschieden.
 
 ## Batterie-Simulation
 
-Zusätzlich simuliert die App eine steuerbare Victron-VE-Batterie auf derselben IP / demselben Port:
+Zusätzlich simuliert die App steuerbare Victron-Batterien (Tab "Victron Batteries", beliebig viele) auf derselben IP / denselben Ports.
+Mehrere Batterien werden über die lokale IP unterschieden (IP-Alias pro Batterie auf diesem PC, Feld "Local IP").
 
 | Parameter | Wert |
 |-----------|------|
-| Host | IP aus der Titelleiste |
-| Port | 5020 |
-| Unit ID | 242 |
+| Host | IP aus der Titelleiste bzw. lokale IP der Batterie |
+| Port | 502 oder 5020 |
+| Unit ID | `0` (System: SoC 843, Cerbo-Leistung 842), `242` / `246` / `227` (VE / CC / Cerbo) |
 | Typ-Empfehlung | `BS_ID_VICTRON_VE_CTRL` |
 
 Abgebildeter Registersatz aus `bs_victron.c`:
@@ -81,8 +82,9 @@ Empfohlene Smartfox-Konfiguration für den Test:
 Schreibverhalten:
 
 - Der Simulator akzeptiert `FC16` auf `37`, `40`, `41`
-- Der zuletzt geschriebene Setpoint wird als Ziel-Leistung übernommen
-- Die gemessene Leistung fährt mit einer kleinen Rampe auf den Zielwert
+- Der geschriebene Setpoint wird als Ziel-Leistung übernommen (bei 3-phasig ×3)
+- Die gemessene Leistung folgt nach einstellbarer Verzögerung mit einstellbarer Rampe, begrenzt durch max. Lade-/Entladeleistung; der SoC wird über die Kapazität mitgerechnet
+- Optionales Lastrauschen (Tab "Victron Batteries") wird auf die Netzleistung addiert
 
 ## Heizstab-Simulation (Debug-Heizstab)
 
@@ -109,7 +111,10 @@ Verhalten:
 
 ## Steuer-API (für Skripte / Claude)
 
-Der Simulator lässt sich lokal über HTTP bedienen: `http://127.0.0.1:8020` (nur localhost). Jeder Aufruf macht dasselbe wie der entsprechende Klick und gibt den gesamten Zustand zurück.
+Der Simulator lässt sich lokal über HTTP bedienen: `http://127.0.0.1:8020` (nur localhost). Jeder Aufruf macht dasselbe wie der entsprechende Klick.
+
+Neu: REST-API unter `/api/...` (Stationen, Heizstäbe, Batterien, Netz, Zähler, Polling, Energiegemeinschaft, Smartfox), siehe [API.md](API.md). Sie wird vom MCP-Server benutzt.
+Die folgenden älteren Aufrufe funktionieren weiter und geben den gesamten Zustand zurück (`POST /battery` wirkt auf die erste Batterie, `power_w` fährt danach wieder auf den Firmware-Setpoint):
 
 | Aufruf | Body (alle Felder optional, außer markiert) |
 |--------|---------------------------------------------|
@@ -125,15 +130,30 @@ Der Simulator lässt sich lokal über HTTP bedienen: `http://127.0.0.1:8020` (nu
 
 Beispiel: `curl -X POST localhost:8020/station/1 -d '{"action":"plug_in"}'`
 
+## Steuerung durch Claude (MCP)
+
+`mcp_server.py` stellt die Steuer-API einer Claude-Session als Tools zur Verfügung (Stationen, Heizstäbe, Batterien, Netz, Energiegemeinschaft, Smartfox konfigurieren, Polling):
+
+```bash
+venv/bin/pip install -r requirements-mcp.txt
+claude mcp add prio-list-simulator -- "$PWD/venv/bin/python" "$PWD/mcp_server.py"
+```
+
+`main.py` muss laufen. Alle Endpunkte und Tools: [API.md](API.md). Hinweise zum Code für Claude-Sessions: [claude_memory.md](claude_memory.md).
+
+## Device Polling
+
+Tab "Device Polling": liest die Liveview-JSON-API des echten Smartfox (`/api/liveview/data`, `/api/liveview/devices`, IP = Smartfox-IP oben) alle N Sekunden. Als Überschuss-Quelle lässt sich die Netzleistung des Geräts übernehmen; optional wird die Leistung der Verbrauchsregler / des Analogausgangs zum Überschuss addiert.
+
 ## Smartfox automatisch einstellen
 
-Oben im Fenster die **Smartfox-IP** eintragen; als Simulator-IP gilt die Auswahl in der Zeile "Modbus TCP". Jedes Gerät hat **Konfigurieren** / **Entfernen**, "Alle konfigurieren" stellt Zähler, Stationen, Heizstäbe und Batterie nacheinander ein. Der Simulator schreibt dazu über die JSON-API des Smartfox (`POST /api/devices/config/<typ>/<slot>`, nur die geänderten Felder; andere Einstellungen des Slots bleiben):
+Oben im Fenster die **Smartfox-IP** eintragen; als Simulator-IP gilt die Auswahl in der Zeile "Modbus TCP". Jedes Gerät hat **Konfigurieren** / **Entfernen**, "Alle konfigurieren" stellt Zähler, Stationen, Heizstäbe und Batterien nacheinander ein. Der Simulator schreibt dazu über die JSON-API des Smartfox (`POST /api/devices/config/<typ>/<slot>`, nur die geänderten Felder; andere Einstellungen des Slots bleiben):
 
 | Simulator | Smartfox-Slot | Produkt (`schnittstelle.id`) | Unit-ID / Port |
 |-----------|---------------|------------------------------|----------------|
 | Station N | Ladestation N−1 (max. 5) | 24 `CC_ID_CC_DEBUG` | `address` = N, Port 5020 |
 | Heizstab k | Verbrauchsregler k | 10 `VB_ID_DEBUG`, Leistung = Nennleistung | 210 + k, Port 5020 (fest) |
-| Victron-Batterie | Batterie 0 | 9 `BS_ID_VICTRON_VE_CTRL` | 242, Port 502 (fest) |
+| Victron-Batterie N | Batterie N−1 (max. 3) | 9 `BS_ID_VICTRON_VE_CTRL` | 242, Port 502 (fest), IP = lokale IP der Batterie (falls gesetzt) |
 | Slave-Zähler | Zähler (Slot wählbar) | 8 Smartfox Slave TCP, "auf Netz addieren" | 1, Port 502 (fest) |
 
 "Entfernen" setzt das Produkt des Slots auf 0. Betriebsart (Automatik/Manuell) und Priorität werden nicht verändert.
