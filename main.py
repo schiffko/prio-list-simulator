@@ -34,6 +34,7 @@ import urllib.error
 import json
 import queue
 import random
+import time
 import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime
@@ -388,6 +389,8 @@ class BatterySimulator:
         self.max_discharge_w   = 5000
         self.ramp_w_per_s      = 2000
         self.delay_s           = 2
+        self.read_interval_s   = 0         # > 0: the power reading is served at most this often, see power_read_allowed()
+        self._last_power_read  = 0.0
         self.phases            = 1         # must match the firmware's three-phase battery setting
         self.temperature_c     = 25.0
         self.setpoint_regs     = [0, 0, 0]
@@ -418,6 +421,21 @@ class BatterySimulator:
             for reg, val in zip(VICTRON_REG_SETPOINTS, self.setpoint_regs):
                 regs[reg] = val
         return [regs.get(start + i, 0) & 0xFFFF for i in range(count)]
+
+    def power_read_allowed(self, unit_id: int, start: int, count: int) -> bool:
+        """Slowly read battery: a power read inside read_interval_s of the last served one gets an exception.
+        bs_victron.c then starts its cycle over (SoC, power, ...) and does not write the setpoint either, so the
+        firmware reads and writes this battery only every read_interval_s, like a slow real device."""
+        if self.read_interval_s <= 0:
+            return True
+        reg = VICTRON_REG_CERBO_P if unit_id == VICTRON_SYSTEM_UNIT else VICTRON_REG_VOLTAGE
+        if not (start <= reg < start + count):
+            return True
+        now = time.monotonic()
+        if now - self._last_power_read < self.read_interval_s:
+            return False
+        self._last_power_read = now
+        return True
 
     def write_registers(self, start: int, values: list):
         for i, value in enumerate(values):
@@ -646,6 +664,10 @@ class CombinedModbusTCPServer:
 
         if func_code == self.FC_READ_HOLDING:
             count   = struct.unpack_from('>H', data, 2)[0]
+            if not battery.power_read_allowed(unit_id, start, count):
+                battery.last_request_time = now
+                battery.last_request_type = f"Unit {unit_id} read {start} qty {count} (gated)"
+                return bytes([func_code | 0x80, 0x06])   # slave device busy
             values  = battery.read_registers(unit_id, start, count)
             battery.last_request_time = now
             battery.last_request_type = f"Unit {unit_id} read {start} qty {count}"
@@ -1231,6 +1253,7 @@ class BatteryWidget(QGroupBox):
             ("max_discharge_w", "Max discharge:",  self._spin(0, 30000, b.max_discharge_w, " W", lambda v: setattr(b, 'max_discharge_w', v))),
             ("ramp_w_per_s",    "Ramp:",           self._spin(1, 30000, b.ramp_w_per_s, " W/s", lambda v: setattr(b, 'ramp_w_per_s', v))),
             ("delay_s",         "Response delay:", self._spin(0, 30, b.delay_s, " s", lambda v: setattr(b, 'delay_s', v))),
+            ("read_interval_s", "Read interval:",  self._spin(0, 60, b.read_interval_s, " s", lambda v: setattr(b, 'read_interval_s', v))),
         ]
         self.spins = {}   # battery attribute -> spin box, used by the control API
         for attr, caption, widget in settings:
@@ -1770,6 +1793,7 @@ class ControlApi:
             "max_discharge_w": b.max_discharge_w,
             "ramp_w_per_s":    b.ramp_w_per_s,
             "delay_s":         b.delay_s,
+            "read_interval_s": b.read_interval_s,
             "temperature_c":   b.temperature_c,
             "setpoint_w":      b.setpoint_w,
             "setpoint_regs":   list(b.setpoint_regs),
@@ -1987,6 +2011,7 @@ class ControlApi:
             "max_discharge_w": (int, 0, 30000),
             "ramp_w_per_s":    (int, 1, 30000),
             "delay_s":         (int, 0, 30),
+            "read_interval_s": (int, 0, 60),
         }
         _reject_unknown(body, set(limits) | {"phases", "local_ip"})
         widget  = self._battery_widget(battery_id)

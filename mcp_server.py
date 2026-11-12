@@ -194,6 +194,7 @@ def add_battery(
     max_discharge_w: int | None = None,
     ramp_w_per_s: int | None = None,
     delay_s: int | None = None,
+    read_interval_s: int | None = None,
     phases: Literal[1, 3] | None = None,
     local_ip: str | None = None,
 ) -> dict:
@@ -218,11 +219,14 @@ def update_battery(
     max_discharge_w: int | None = None,
     ramp_w_per_s: int | None = None,
     delay_s: int | None = None,
+    read_interval_s: int | None = None,
     phases: Literal[1, 3] | None = None,
     local_ip: str | None = None,
 ) -> dict:
     """Change battery settings. Only given fields are changed.
 
+    read_interval_s (0-60, 0 = off): power reads inside it get a Modbus exception, so the firmware reads
+    and writes the battery only that often (slow real device).
     phases must match the firmware's three-phase battery setting. local_ip: empty string = answer
     on any local IP (several batteries need one IP alias each).
     """

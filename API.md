@@ -44,7 +44,7 @@ If the API runs on a different port: `claude mcp add prio-list-simulator -e SIM_
 | `update_heater` | `slot` (0-2), `nominal_power_w`?, `temperature_c`?, `max_temp_c`?, `auto_temperature`?, `force_max_temp`? | Change a debug heater (unit-ID 210 + slot) |
 | `set_grid` | `surplus_w`?, `noise_enabled`?, `noise_amplitude_w`? | Base grid power (neg = PV surplus) and load noise |
 | `reset_meter_energy` | `forward`=true, `reverse`=true | Reset the meter's Wh counters |
-| `add_battery` | `soc`?, `capacity_kwh`?, `temperature_c`?, `max_charge_w`?, `max_discharge_w`?, `ramp_w_per_s`?, `delay_s`?, `phases`?, `local_ip`? | Add a Victron battery with optional settings |
+| `add_battery` | `soc`?, `capacity_kwh`?, `temperature_c`?, `max_charge_w`?, `max_discharge_w`?, `ramp_w_per_s`?, `delay_s`?, `read_interval_s`?, `phases`?, `local_ip`? | Add a Victron battery with optional settings |
 | `clear_batteries` | none | Remove all batteries |
 | `update_battery` | `battery_id` + same fields as `add_battery` | Change battery settings |
 | `update_community` | `enabled`?, `others_w`?, `key`? | Energy community (EVG) feed to the Smartfox |
@@ -81,7 +81,7 @@ with an `{"error": ...}` message.
 | POST | `/api/batteries` | optional battery fields | the new battery |
 | DELETE | `/api/batteries` | none | `{ok}` |
 | GET | `/api/batteries/{id}` | none | battery |
-| PATCH | `/api/batteries/{id}` | `soc` (0-100), `capacity_kwh` (0.1-200), `temperature_c` (-40..100), `max_charge_w` / `max_discharge_w` (0-30000), `ramp_w_per_s` (1-30000), `delay_s` (0-30), `phases` (1/3), `local_ip` | battery |
+| PATCH | `/api/batteries/{id}` | `soc` (0-100), `capacity_kwh` (0.1-200), `temperature_c` (-40..100), `max_charge_w` / `max_discharge_w` (0-30000), `ramp_w_per_s` (1-30000), `delay_s` (0-30), `read_interval_s` (0-60, 0 = off: power reads inside it get Modbus exception 6, so the firmware reads and writes the battery only that often), `phases` (1/3), `local_ip` | battery |
 | GET | `/api/polling` | none | polling config + last polled values |
 | PATCH | `/api/polling` | `enabled`, `ip`, `interval_s` (1-60), `surplus_source` (`null` / `detailsPowerValue_neg` / `toGridValue_kw`), `heater_in_surplus` | polling (`409` when changing ip/interval while enabled) |
 | GET | `/api/community` | none | community |
@@ -112,7 +112,7 @@ curl -s -X PATCH localhost:8020/api/grid -H 'Content-Type: application/json' -d 
 - **meter**: `total_power_w, phase_powers_w[3], phase_currents_ma[3], energy_forward_wh,
   energy_reverse_wh, smartfox_slot, last_request{time,type}, config_status`
 - **battery**: `id, local_ip, phases, capacity_kwh, soc, max_charge_w, max_discharge_w,
-  ramp_w_per_s, delay_s, temperature_c, setpoint_w, setpoint_regs[3], actual_power_w,
+  ramp_w_per_s, delay_s, read_interval_s, temperature_c, setpoint_w, setpoint_regs[3], actual_power_w,
   last_request{time,type}`
 - **community**: `enabled, others_w, key, own_delayed_w, community_power, my_surplus,
   expected_share_w, last_result`
